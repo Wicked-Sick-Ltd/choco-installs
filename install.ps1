@@ -5,3 +5,4 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManage
 # Now in a new shell, here are the most common ones I install
 
 choco install googlechrome
+choco install rclone
