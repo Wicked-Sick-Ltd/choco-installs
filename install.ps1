@@ -2,6 +2,48 @@
 # Chocolatey bootstrap for a new Windows machine
 # =========================================================
 
+[CmdletBinding()]
+param(
+    [string]$LogPath = "",
+    [switch]$EnableLogging
+)
+
+$ErrorActionPreference = 'Continue'
+Set-StrictMode -Version Latest
+
+# Configure optional logging
+$UseLogging = $EnableLogging.IsPresent -or -not [string]::IsNullOrWhiteSpace($LogPath)
+if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+    try {
+        $logDir = Split-Path -Path $LogPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+    }
+    catch {
+        Write-Warning "Unable to create log directory for '$LogPath'. Logging disabled. Error: $($_.Exception.Message)"
+        $UseLogging = $false
+    }
+}
+elseif ($UseLogging) {
+    $LogPath = Join-Path -Path $PSScriptRoot -ChildPath ("install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+}
+
+if ($UseLogging) {
+    Write-Host "Logging enabled: $LogPath" -ForegroundColor Cyan
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ($UseLogging) {
+        Add-Content -Path $LogPath -Value ("[{0}] {1}" -f (Get-Date -Format "s"), $Message)
+    }
+}
+
 # 1. Install Chocolatey (run in an elevated PowerShell)
 Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
@@ -10,100 +52,150 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManage
 #    choco install -y googlechrome rclone vim rsync gh git 7zip ...
 #    The -y flag skips confirmation prompts, useful for a full bootstrap run.
 
-# -----------------------------------------------------------
-# My seed list
-# -----------------------------------------------------------
-choco install -y googlechrome
-choco install -y rclone
-choco install -y vim
-choco install -y rsync
-choco install -y gh
-choco install -y git
+$packages = @(
+    # -----------------------------------------------------------
+    # My seed list
+    # -----------------------------------------------------------
+    'googlechrome',
+    'rclone',
+    'vim',
+    'rsync',
+    'gh',
+    'git',
 
-# -----------------------------------------------------------
-# Core CLI / shell essentials (pairs naturally with git/gh/vim)
-# -----------------------------------------------------------
-choco install -y 7zip                 # archive tool, used everywhere
-choco install -y curl                 # Windows ships one, but choco's is often newer
-choco install -y wget
-choco install -y jq                   # JSON processor, invaluable with gh/curl
-choco install -y sudo                 # gsudo-style elevation from any shell
-choco install -y grep
-choco install -y sed
-choco install -y less
+    # -----------------------------------------------------------
+    # Core CLI / shell essentials (pairs naturally with git/gh/vim)
+    # -----------------------------------------------------------
+    '7zip',                 # archive tool, used everywhere
+    'curl',                 # Windows ships one, but choco's is often newer
+    'wget',
+    'jq',                   # JSON processor, invaluable with gh/curl
+    'sudo',                 # gsudo-style elevation from any shell
+    'grep',
+    'sed',
+    'less',
 
-# -----------------------------------------------------------
-# Terminal / shell environment
-# -----------------------------------------------------------
-choco install -y microsoft-windows-terminal
-choco install -y powershell-core      # pwsh (v7+), alongside Windows PowerShell
-choco install -y starship             # cross-shell prompt, works well with git
+    # -----------------------------------------------------------
+    # Terminal / shell environment
+    # -----------------------------------------------------------
+    'microsoft-windows-terminal',
+    'powershell-core',      # pwsh (v7+), alongside Windows PowerShell
+    'starship',             # cross-shell prompt, works well with git
 
-# -----------------------------------------------------------
-# Editors / IDEs
-# -----------------------------------------------------------
-choco install -y vscode
-choco install -y notepadplusplus
+    # -----------------------------------------------------------
+    # Editors / IDEs
+    # -----------------------------------------------------------
+    'vscode',
+    'notepadplusplus',
 
-# -----------------------------------------------------------
-# Dev runtimes & package managers
-# (skip any you don't personally use)
-# -----------------------------------------------------------
-choco install -y nodejs-lts
-choco install -y python
-choco install -y openjdk
-choco install -y golang
-choco install -y rust
+    # -----------------------------------------------------------
+    # Dev runtimes & package managers
+    # (skip any you don't personally use)
+    # -----------------------------------------------------------
+    'nodejs-lts',
+    'python',
+    'openjdk',
+    'golang',
+    'rust',
 
-# -----------------------------------------------------------
-# Containers / virtualization
-# -----------------------------------------------------------
-choco install -y docker-desktop
+    # -----------------------------------------------------------
+    # Containers / virtualization
+    # -----------------------------------------------------------
+    'docker-desktop',
 
-# -----------------------------------------------------------
-# Cloud & infra CLIs
-# -----------------------------------------------------------
-choco install -y awscli
-choco install -y azure-cli
-choco install -y terraform
-choco install -y kubernetes-cli       # kubectl
+    # -----------------------------------------------------------
+    # Cloud & infra CLIs
+    # -----------------------------------------------------------
+    'awscli',
+    'azure-cli',
+    'terraform',
+    'kubernetes-cli',       # kubectl
 
-# -----------------------------------------------------------
-# Networking / remote access
-# -----------------------------------------------------------
-choco install -y putty                # ssh/telnet client + puttygen
-choco install -y winscp               # GUI sftp/scp, complements rsync
-choco install -y openssh              # ssh/scp/sftp client+server if not already present
-choco install -y mobaxterm             # alternative all-in-one terminal + X server
+    # -----------------------------------------------------------
+    # Networking / remote access
+    # -----------------------------------------------------------
+    'putty',                # ssh/telnet client + puttygen
+    'winscp',               # GUI sftp/scp, complements rsync
+    'openssh',              # ssh/scp/sftp client+server if not already present
+    'mobaxterm',            # alternative all-in-one terminal + X server
 
-# -----------------------------------------------------------
-# API / DB tooling
-# -----------------------------------------------------------
-choco install -y postman
-choco install -y dbeaver              # universal DB GUI client
+    # -----------------------------------------------------------
+    # API / DB tooling
+    # -----------------------------------------------------------
+    'postman',
+    'dbeaver',              # universal DB GUI client
 
-# -----------------------------------------------------------
-# System utilities (Sysinternals-adjacent, general QoL)
-# -----------------------------------------------------------
-choco install -y powertoys            # not enough people know about this.  It's the best thing on windows no-one knows about! Window snapping, FancyZones, PowerToys Run, etc.
-choco install -y sysinternals          # full Sysinternals suite - these are still going strong after all these years
-choco install -y everything            # instant file search
-choco install -y treesizefree          # disk usage visualizer
+    # -----------------------------------------------------------
+    # System utilities (Sysinternals-adjacent, general QoL)
+    # -----------------------------------------------------------
+    'powertoys',            # not enough people know about this. It's the best thing on windows no-one knows about! Window snapping, FancyZones, PowerToys Run, etc.
+    'sysinternals',         # full Sysinternals suite - these are still going strong after all these years
+    'everything',           # instant file search
+    'treesizefree',         # disk usage visualizer
 
-# -----------------------------------------------------------
-# Browsers (beyond Chrome, useful for cross-browser testing)
-# -----------------------------------------------------------
-choco install -y firefox
-choco install -y microsoft-edge
+    # -----------------------------------------------------------
+    # Browsers (beyond Chrome, useful for cross-browser testing)
+    # -----------------------------------------------------------
+    'firefox',
+    'microsoft-edge',
 
-# -----------------------------------------------------------
-# Media / misc
-# -----------------------------------------------------------
-choco install -y vlc
-choco install -y ffmpeg 
-choco install -y greenshot             # lightweight screenshot tool
+    # -----------------------------------------------------------
+    # Media / misc
+    # -----------------------------------------------------------
+    'vlc',
+    'ffmpeg',
+    'greenshot',            # lightweight screenshot tool
 
-# -----------------------------------------------------------
-# Fonts (nice with Windows Terminal / vim / vscode)
-# -----------------------------------------------------------
-choco install -y cascadia-code-nerd-font
+    # -----------------------------------------------------------
+    # Fonts (nice with Windows Terminal / vim / vscode)
+    # -----------------------------------------------------------
+    'cascadia-code-nerd-font'
+)
+
+$failedPackages = New-Object System.Collections.Generic.List[string]
+
+Write-Host "Installing $($packages.Count) package(s)..." -ForegroundColor Cyan
+Write-Log "Installing $($packages.Count) package(s): $($packages -join ', ')"
+
+foreach ($pkg in $packages) {
+    Write-Host "==> Installing $pkg" -ForegroundColor Yellow
+    Write-Log "BEGIN install: $pkg"
+
+    $output = & choco install -y $pkg 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($UseLogging) {
+        Add-Content -Path $LogPath -Value $output
+    }
+
+    if ($exitCode -eq 0) {
+        Write-Host "✅ $pkg installed successfully" -ForegroundColor Green
+        Write-Log "SUCCESS install: $pkg (exit code $exitCode)"
+    }
+    else {
+        Write-Warning "❌ $pkg failed (exit code $exitCode)"
+        Write-Log "FAIL install: $pkg (exit code $exitCode)"
+        $failedPackages.Add($pkg) | Out-Null
+    }
+}
+
+Write-Host ""
+Write-Host "Install run complete." -ForegroundColor Cyan
+Write-Log "Install run complete. Failures: $($failedPackages.Count)"
+
+if ($failedPackages.Count -gt 0) {
+    $failedList = $failedPackages -join ', '
+    Write-Warning "Some package installs failed: $failedList"
+    Write-Host "Review output above and retry failed packages individually." -ForegroundColor Yellow
+
+    if ($UseLogging) {
+        Write-Host "Log file: $LogPath" -ForegroundColor Yellow
+        Write-Log "Failed packages: $failedList"
+    }
+}
+else {
+    Write-Host "✅ All packages installed successfully." -ForegroundColor Green
+    if ($UseLogging) {
+        Write-Host "Log file: $LogPath" -ForegroundColor Green
+    }
+}
