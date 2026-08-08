@@ -11,7 +11,7 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManage
 #    The -y flag skips confirmation prompts, useful for a full bootstrap run.
 
 # -----------------------------------------------------------
-# Your originals
+# My seed list
 # -----------------------------------------------------------
 choco install -y googlechrome
 choco install -y rclone
@@ -70,7 +70,6 @@ choco install -y kubernetes-cli       # kubectl
 
 # -----------------------------------------------------------
 # Networking / remote access
-# (rclone + rsync suggest you move data around a lot)
 # -----------------------------------------------------------
 choco install -y putty                # ssh/telnet client + puttygen
 choco install -y winscp               # GUI sftp/scp, complements rsync
@@ -86,8 +85,8 @@ choco install -y dbeaver              # universal DB GUI client
 # -----------------------------------------------------------
 # System utilities (Sysinternals-adjacent, general QoL)
 # -----------------------------------------------------------
-choco install -y powertoys            # window snapping, FancyZones, PowerToys Run, etc.
-choco install -y sysinternals          # full Sysinternals suite
+choco install -y powertoys            # not enough people know about this.  It's the best thing on windows no-one knows about! Window snapping, FancyZones, PowerToys Run, etc.
+choco install -y sysinternals          # full Sysinternals suite - these are still going strong after all these years
 choco install -y everything            # instant file search
 choco install -y treesizefree          # disk usage visualizer
 
@@ -101,6 +100,7 @@ choco install -y microsoft-edge
 # Media / misc
 # -----------------------------------------------------------
 choco install -y vlc
+choco install -y ffmpeg 
 choco install -y greenshot             # lightweight screenshot tool
 
 # -----------------------------------------------------------
