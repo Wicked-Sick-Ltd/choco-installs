@@ -29,14 +29,22 @@ git clone https://github.com/Wicked-Sick-Ltd/choco-installs.git
 cd choco-installs
 ```
 
-2. Run the install script/package list command used in this repo.
+2. Open **PowerShell as Administrator** (elevated).
 
-> If your script file name differs, update the command accordingly.
+3. Allow script execution for the **current session only**, then run the install script:
 
 ```powershell
-# Example (adjust to your script file)
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install.ps1
 ```
+
+> [!WARNING]
+> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` temporarily lowers protections for this PowerShell session.
+> Only run scripts you trust and have reviewed. Do **not** use broader scopes (like `LocalMachine`) unless you understand and accept the security impact.
+
+If script execution is blocked, PowerShell can show an error similar to:
+
+`running scripts is disabled on this system` (`PSSecurityException`).
 
 ## Customizing your package set
 
