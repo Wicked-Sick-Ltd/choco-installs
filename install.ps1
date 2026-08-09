@@ -118,6 +118,7 @@ $packages = @(
     'winscp',               # GUI sftp/scp, complements rsync
     'openssh',              # ssh/scp/sftp client+server if not already present
     'mobaxterm',            # alternative all-in-one terminal + X server
+    'nmap',                 # network scanner 
 
     # -----------------------------------------------------------
     # API / DB tooling
