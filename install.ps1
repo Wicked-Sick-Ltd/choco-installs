@@ -74,6 +74,7 @@ $packages = @(
     'grep',
     'sed',
     'less',
+    'winrar',
 
     # -----------------------------------------------------------
     # Terminal / shell environment
