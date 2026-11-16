@@ -143,9 +143,9 @@ Use-ProtectedTemp
 Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
 # 2. Open a NEW shell (so choco is on PATH), then install packages below.
-#    Tip: you can install everything in one go with:
-#    choco install -y googlechrome rclone vim rsync gh git 7zip ...
-#    The -y flag skips confirmation prompts, useful for a full bootstrap run.
+#    Install through this script rather than a bare `choco install` in your
+#    shell: the loop below points TEMP at the protected directory for every
+#    package. The -y flag it passes skips confirmation prompts.
 
 $packages = @(
     # -----------------------------------------------------------
