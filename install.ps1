@@ -44,6 +44,101 @@ function Write-Log {
     }
 }
 
+# The Chocolatey bootstrap and package scripts unpack into TEMP and then run or
+# copy what they find there with this session's elevated rights. The logged-on
+# user's TEMP (or any directory they can write) lets that user swap the files in
+# between, so every install uses a directory only SYSTEM and Administrators can
+# write.
+function New-ProtectedTempDirectory {
+    $ErrorActionPreference = 'Stop'
+    $name = "choco-installs-{0}" -f [guid]::NewGuid().ToString('n')
+
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        # mktemp creates the directory 0700 in one step.
+        $path = & mktemp -d (Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath "$name-XXXXXXXX")
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($path)) {
+            throw "mktemp failed to create a private temp directory."
+        }
+        return $path
+    }
+
+    # Resolved through the known-folder API: $env:ProgramData can be overridden
+    # from the user's own environment.
+    $parent = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        throw "Unable to resolve the ProgramData folder."
+    }
+    $path = Join-Path -Path $parent -ChildPath $name
+
+    $systemSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $adminsSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $allowedSids = @($systemSid.Value, $adminsSid.Value)
+
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetOwner($adminsSid)
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($systemSid, $adminsSid)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+
+    # The owner and DACL are applied by the create call itself, so there is no
+    # window in which the directory carries ProgramData's inherited
+    # Users-can-create ACEs. Creating it with an Administrators owner also fails
+    # outside an elevated session.
+    # Windows PowerShell keeps these types in mscorlib.
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        Add-Type -AssemblyName System.IO.FileSystem.AccessControl
+    }
+    $aclExtensions = 'System.IO.FileSystemAclExtensions' -as [type]
+    if ($null -ne $aclExtensions) {
+        $aclExtensions::Create((New-Object System.IO.DirectoryInfo($path)), $security)
+    }
+    else {
+        $null = [System.IO.Directory]::CreateDirectory($path, $security)
+    }
+
+    # Both create calls succeed silently on an existing directory, so refuse
+    # anything that does not carry exactly the descriptor requested above.
+    $acl = Get-Acl -LiteralPath $path
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $allowedSids) {
+        throw "Temp directory '$path' is owned by $owner, not SYSTEM or Administrators."
+    }
+    if (-not $acl.AreAccessRulesProtected) {
+        throw "Temp directory '$path' inherits permissions from its parent."
+    }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or $rule.IdentityReference.Value -notin $allowedSids) {
+            throw "Temp directory '$path' grants access to $($rule.IdentityReference.Value)."
+        }
+    }
+
+    return $path
+}
+
+function Use-ProtectedTemp {
+    $env:TEMP = $ProtectedTemp
+    $env:TMP = $ProtectedTemp
+}
+
+$OriginalTemp = $env:TEMP
+$OriginalTmp = $env:TMP
+try {
+    $ProtectedTemp = New-ProtectedTempDirectory
+}
+catch {
+    Write-Log "ABORT: unable to create a protected temp directory: $($_.Exception.Message)"
+    throw "Unable to create a temp directory that only SYSTEM and Administrators can write. Run this script from an elevated PowerShell session. $($_.Exception.Message)"
+}
+Write-Log "Using protected temp directory: $ProtectedTemp"
+Use-ProtectedTemp
+
 # 1. Install Chocolatey (run in an elevated PowerShell)
 Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
@@ -163,6 +258,9 @@ foreach ($pkg in $packages) {
     Write-Host "==> Installing $pkg" -ForegroundColor Yellow
     Write-Log "BEGIN install: $pkg"
 
+    # Chocolatey's setup can reload session variables from the registry, which
+    # would put TEMP back on the user's profile.
+    Use-ProtectedTemp
     $output = & choco install -y $pkg 2>&1
     $exitCode = $LASTEXITCODE
 
@@ -180,6 +278,10 @@ foreach ($pkg in $packages) {
         $failedPackages.Add($pkg) | Out-Null
     }
 }
+
+$env:TEMP = $OriginalTemp
+$env:TMP = $OriginalTmp
+Remove-Item -LiteralPath $ProtectedTemp -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Install run complete." -ForegroundColor Cyan
