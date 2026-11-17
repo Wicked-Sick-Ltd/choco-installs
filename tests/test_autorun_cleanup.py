@@ -180,6 +180,24 @@ class AutoRunCleanupTests(unittest.TestCase):
         self.assert_restored(restored)
         self.assertFalse(self.recovery_path().exists())
 
+    def test_recovery_file_cannot_set_an_arbitrary_registry_path(self):
+        empty = {HKLM: None, HKLM_WOW: None, HKCU: None}
+        unexpected = r"HKLM:\Software\Unexpected"
+        recovery = {
+            "autorun": [
+                {"path": unexpected, "kind": "String", "value": "echo planted"},
+                {"path": HKCU, "kind": "ExpandString", "value": r"echo %SystemRoot%\stay"},
+            ],
+            "userComSpec": None,
+        }
+        proc, restored, log = self.run_install(registry=empty, recovery=recovery)
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertNotIn(unexpected, restored)
+        self.assertEqual(restored[HKCU], {"kind": "ExpandString", "value": r"echo %SystemRoot%\stay"})
+        self.assertIsNone(restored[HKLM])
+        self.assert_absent_during_installs(log)
+        self.assertFalse(self.recovery_path().exists())
+
 
 if __name__ == "__main__":
     unittest.main()

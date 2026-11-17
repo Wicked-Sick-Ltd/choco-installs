@@ -231,6 +231,7 @@ $Script:HadUserComSpec = $false
 $Script:SavedUserComSpec = $null
 $Script:ReplacedCommandProcessorLink = $false
 $Script:InstallRecoveryFailed = $false
+$Script:OriginalCommandProcessorDacl = $null
 
 function Save-CommandProcessorAutoRunValue {
     param(
@@ -439,9 +440,151 @@ function Get-InstallRecoveryPath {
         if ([string]::IsNullOrWhiteSpace($parent)) {
             throw "Unable to resolve ProgramData for the AutoRun recovery file."
         }
-        return Join-Path -Path $parent -ChildPath 'choco-installs-autorun-recovery.json'
+        return Join-Path -Path $parent -ChildPath 'choco-installs-recovery\autorun.json'
     }
     return Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'choco-installs-autorun-recovery.json'
+}
+
+function Test-AdminOnlyAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $acl = Get-Acl -LiteralPath $Path
+    $systemSid = (New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)).Value
+    $adminsSid = (New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)).Value
+    $allowed = @($systemSid, $adminsSid)
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $allowed -or -not $acl.AreAccessRulesProtected) {
+        return $false
+    }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or $rule.IdentityReference.Value -notin $allowed) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Initialize-InstallRecoveryDirectory {
+    if (-not $OnWindows) {
+        return
+    }
+    $directory = Split-Path -Path (Get-InstallRecoveryPath) -Parent
+    if (-not (Test-Path -LiteralPath $directory)) {
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $adminsSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        $security = New-Object System.Security.AccessControl.DirectorySecurity
+        $security.SetOwner($adminsSid)
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @($systemSid, $adminsSid)) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $security.AddAccessRule($rule)
+        }
+        if ($PSVersionTable.PSEdition -eq 'Core') {
+            Add-Type -AssemblyName System.IO.FileSystem.AccessControl
+        }
+        $aclExtensions = 'System.IO.FileSystemAclExtensions' -as [type]
+        if ($null -ne $aclExtensions) {
+            $aclExtensions::Create((New-Object System.IO.DirectoryInfo($directory)), $security)
+        }
+        else {
+            $null = [System.IO.Directory]::CreateDirectory($directory, $security)
+        }
+    }
+    if (-not (Test-AdminOnlyAcl -Path $directory)) {
+        throw "The AutoRun recovery directory is not limited to SYSTEM and Administrators."
+    }
+}
+
+function Protect-RecoveryFileAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @(
+            [System.Security.Principal.WellKnownSidType]::LocalSystemSid,
+            [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid
+        )) {
+        $account = New-Object System.Security.Principal.SecurityIdentifier($sid, $null)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $account,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $security
+    if (-not (Test-AdminOnlyAcl -Path $Path)) {
+        throw "The AutoRun recovery file is not limited to SYSTEM and Administrators."
+    }
+}
+
+function Capture-CommandProcessorDacl {
+    if (-not $OnWindows -or -not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
+        return
+    }
+    $relative = 'Software\Microsoft\Command Processor'
+    if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
+        return
+    }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($relative)
+    if ($null -eq $key) {
+        return
+    }
+    try {
+        $Script:OriginalCommandProcessorDacl = $key.GetAccessControl().GetSecurityDescriptorSddlForm('Access')
+    }
+    catch {
+        Write-Log "WARN could not read the Command Processor DACL; the key will inherit permissions after the install."
+    }
+    finally {
+        $key.Close()
+    }
+}
+
+function Restore-CommandProcessorDacl {
+    if (-not $OnWindows) {
+        return
+    }
+    $relative = 'Software\Microsoft\Command Processor'
+    $rights = [System.Security.AccessControl.RegistryRights]'ChangePermissions, ReadPermissions'
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+        $relative,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        $rights)
+    if ($null -eq $key) {
+        return
+    }
+    try {
+        $security = $key.GetAccessControl()
+        if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
+            $security.SetSecurityDescriptorSddlForm(
+                $Script:OriginalCommandProcessorDacl,
+                [System.Security.AccessControl.AccessControlSections]::Access)
+        }
+        else {
+            $security.SetAccessRuleProtection($false, $false)
+        }
+        $key.SetAccessControl($security)
+        Write-Log "Restored permissions on HKCU\$relative."
+    }
+    catch {
+        $Script:InstallRecoveryFailed = $true
+        Write-Warning "Unable to restore permissions on HKCU\$relative. Error: $($_.Exception.Message)"
+        Write-Log "FAIL restore Command Processor permissions: $($_.Exception.Message)"
+    }
+    finally {
+        $key.Close()
+    }
 }
 
 function Write-InstallRecoveryFile {
@@ -454,27 +597,16 @@ function Write-InstallRecoveryFile {
             }) | Out-Null
     }
     $payload = [pscustomobject]@{
-        autorun     = $autorun
-        userComSpec = $(if ($Script:HadUserComSpec) { $Script:SavedUserComSpec } else { $null })
+        autorun                = $autorun
+        userComSpec            = $(if ($Script:HadUserComSpec) { $Script:SavedUserComSpec } else { $null })
+        commandProcessorDacl   = $Script:OriginalCommandProcessorDacl
     }
+    Initialize-InstallRecoveryDirectory
     $path = Get-InstallRecoveryPath
     $json = $payload | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText($path, $json)
     if ($OnWindows) {
-        $security = New-Object System.Security.AccessControl.FileSecurity
-        $security.SetAccessRuleProtection($true, $false)
-        foreach ($sid in @(
-                [System.Security.Principal.WellKnownSidType]::LocalSystemSid,
-                [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid
-            )) {
-            $account = New-Object System.Security.Principal.SecurityIdentifier($sid, $null)
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $account,
-                [System.Security.AccessControl.FileSystemRights]::FullControl,
-                [System.Security.AccessControl.AccessControlType]::Allow)
-            $security.AddAccessRule($rule)
-        }
-        Set-Acl -LiteralPath $path -AclObject $security
+        Protect-RecoveryFileAcl -Path $path
     }
     Write-Log "Wrote AutoRun and user ComSpec recovery file before removing the values."
 }
@@ -483,6 +615,14 @@ function Import-InstallRecoveryFile {
     $path = Get-InstallRecoveryPath
     if (-not (Test-Path -LiteralPath $path)) {
         return
+    }
+    if ($OnWindows) {
+        $directory = Split-Path -Path $path -Parent
+        if (-not (Test-AdminOnlyAcl -Path $directory) -or -not (Test-AdminOnlyAcl -Path $path)) {
+            Write-Warning "Refusing to read the AutoRun recovery file because it is not limited to SYSTEM and Administrators."
+            Write-Log "REFUSE recovery file: ACL is not limited to SYSTEM and Administrators."
+            return
+        }
     }
     $data = $null
     try {
@@ -500,31 +640,42 @@ function Import-InstallRecoveryFile {
         $entries = @($data.autorun)
     }
     foreach ($saved in $entries) {
+        $pathProperty = $saved.PSObject.Properties['path']
+        if ($null -eq $pathProperty -or $pathProperty.Value -notin $AutoRunKeyPaths) {
+            Write-Warning "Ignoring a recovery entry whose registry path is not a Command Processor AutoRun key."
+            Write-Log "IGNORE recovery entry for an unexpected registry path."
+            continue
+        }
         try {
-            if (-not (Test-Path -LiteralPath $saved.path)) {
-                New-Item -Path $saved.path -Force -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath $pathProperty.Value)) {
+                New-Item -Path $pathProperty.Value -Force -ErrorAction Stop | Out-Null
             }
             $typeName = [string]$saved.kind
             if ([string]::IsNullOrWhiteSpace($typeName) -or $typeName -eq 'Unknown' -or $typeName -eq 'None') {
                 $typeName = 'String'
             }
-            New-ItemProperty -Path $saved.path -Name AutoRun -Value $saved.value -PropertyType $typeName -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -Path $pathProperty.Value -Name AutoRun -Value $saved.value -PropertyType $typeName -Force -ErrorAction Stop | Out-Null
         }
         catch {
             $failed = $true
-            Write-Warning "Unable to restore cmd.exe AutoRun at $($saved.path) from the previous install. Set it again to: $($saved.value)"
-            Write-Log "FAIL import AutoRun at $($saved.path): $($_.Exception.Message). Previous value: $($saved.value)"
+            Write-Warning "Unable to restore cmd.exe AutoRun at $($pathProperty.Value) from the previous install. Set it again to: $($saved.value)"
+            Write-Log "FAIL import AutoRun at $($pathProperty.Value): $($_.Exception.Message). Previous value: $($saved.value)"
         }
     }
-    if ($null -ne $data.userComSpec -and -not [string]::IsNullOrEmpty([string]$data.userComSpec)) {
+    $daclProperty = $data.PSObject.Properties['commandProcessorDacl']
+    if ($null -ne $daclProperty -and -not [string]::IsNullOrWhiteSpace([string]$daclProperty.Value)) {
+        $Script:OriginalCommandProcessorDacl = [string]$daclProperty.Value
+    }
+    $comSpecProperty = $data.PSObject.Properties['userComSpec']
+    if ($null -ne $comSpecProperty -and -not [string]::IsNullOrEmpty([string]$comSpecProperty.Value)) {
         try {
-            [System.Environment]::SetEnvironmentVariable('ComSpec', [string]$data.userComSpec, 'User')
+            [System.Environment]::SetEnvironmentVariable('ComSpec', [string]$comSpecProperty.Value, 'User')
             Write-Log "Restored the user ComSpec value from the previous install."
         }
         catch {
             $failed = $true
-            Write-Warning "Unable to restore the user ComSpec value from the previous install. Set it again to: $($data.userComSpec)"
-            Write-Log "FAIL import user ComSpec: $($_.Exception.Message). Previous value: $($data.userComSpec)"
+            Write-Warning "Unable to restore the user ComSpec value from the previous install. Set it again to: $($comSpecProperty.Value)"
+            Write-Log "FAIL import user ComSpec: $($_.Exception.Message). Previous value: $($comSpecProperty.Value)"
         }
     }
     if (-not $failed) {
@@ -550,6 +701,7 @@ function Restore-InstallGuards {
     }
     Restore-CommandProcessorAutoRunValues
     if ($OnWindows) {
+        Restore-CommandProcessorDacl
         Resume-UserComSpec
     }
     Remove-InstallRecoveryFile
@@ -610,6 +762,7 @@ try {
         # system() starts %ComSpec%, which a per-user environment variable can override.
         $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
 
+        Capture-CommandProcessorDacl
         foreach ($subKey in @('Software', 'Software\Microsoft')) {
             [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey).Close()
             Set-UserKeyIntegrityLabel -SubKey $subKey -Label 'S:(ML;;NW;;;HI)'
