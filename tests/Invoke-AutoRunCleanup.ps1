@@ -211,6 +211,9 @@ function New-ItemProperty {
     if ($Name -ne 'AutoRun') {
         return
     }
+    if ($env:CHOCO_TEST_FAIL_RESTORE_PATH -and $Path -eq $env:CHOCO_TEST_FAIL_RESTORE_PATH) {
+        throw "simulated failure restoring AutoRun"
+    }
     $store = Read-Store
     $store[$Path] = @{ kind = [string]$PropertyType; value = $Value }
     Write-Store $store

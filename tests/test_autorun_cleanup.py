@@ -68,6 +68,7 @@ class AutoRunCleanupTests(unittest.TestCase):
             env.pop("CHOCO_TEST_STOP_AT", None)
             env.pop("CHOCO_TEST_BOOTSTRAP_FAIL", None)
             env.pop("CHOCO_TEST_NO_CHOCO", None)
+            env.pop("CHOCO_TEST_FAIL_RESTORE_PATH", None)
             if extra_env:
                 env.update(extra_env)
             proc = subprocess.run(
@@ -197,6 +198,27 @@ class AutoRunCleanupTests(unittest.TestCase):
         self.assertIsNone(restored[HKLM])
         self.assert_absent_during_installs(log)
         self.assertFalse(self.recovery_path().exists())
+
+    def test_failed_import_does_not_overwrite_the_recovery_file(self):
+        empty = {HKLM: None, HKLM_WOW: None, HKCU: None}
+        recovery = {
+            "autorun": [
+                {"path": HKLM, "kind": "String", "value": "echo stay-hklm"},
+                {"path": HKCU, "kind": "ExpandString", "value": r"echo %SystemRoot%\stay"},
+            ],
+            "userComSpec": None,
+        }
+        proc, restored, _log = self.run_install(
+            {"CHOCO_TEST_FAIL_RESTORE_PATH": HKCU},
+            registry=empty,
+            recovery=recovery,
+        )
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        kept = json.loads(self.recovery_path().read_text())
+        kept_paths = {entry["path"]: entry["value"] for entry in kept["autorun"]}
+        self.assertEqual(kept_paths[HKCU], r"echo %SystemRoot%\stay")
+        self.assertEqual(kept_paths[HKLM], "echo stay-hklm")
+        self.assertIsNone(restored[HKCU])
 
 
 if __name__ == "__main__":

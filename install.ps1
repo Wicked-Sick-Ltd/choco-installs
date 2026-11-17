@@ -382,7 +382,9 @@ function Protect-UserCommandProcessorKey {
     if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
         [RegistryIntegrityLabel]::DeleteSymbolicLink($relative)
         # DACL for SYSTEM and Administrators, plus the High no-write-up label, in the create itself.
-        [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)S:(ML;;NW;;;HI)')
+        # A SACL in the create call needs SeSecurityPrivilege, which a normal elevated
+        # token does not have enabled. The label is applied by the call below.
+        [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)')
         Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
         $Script:ReplacedCommandProcessorLink = $true
         Write-Warning "Replaced the registry link at HKCU\$relative so an existing handle cannot set AutoRun."
@@ -415,7 +417,9 @@ function Protect-UserCommandProcessorKey {
         $hive.DeleteSubKey($relative, $true)
     }
 
-    [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)S:(ML;;NW;;;HI)')
+    # A SACL in the create call needs SeSecurityPrivilege, which a normal elevated
+    # token does not have enabled. The label is applied by the call below.
+    [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)')
     $created = $hive.OpenSubKey($relative, $true)
     if ($null -eq $created) {
         throw "HKCU\$relative could not be reopened after it was created."
@@ -540,7 +544,19 @@ function Protect-RecoveryFileAcl {
 function Test-ScriptRestrictedDacl {
     param([string]$Sddl)
     $normalized = ([string]$Sddl) -replace '\s', ''
-    return $normalized -eq 'D:P(A;;KA;;;SY)(A;;KA;;;BA)' -or $normalized -eq 'D:P(A;;KA;;;BA)(A;;KA;;;SY)'
+    if ($normalized -notmatch '^D:P') {
+        return $false
+    }
+    $aces = [regex]::Matches($normalized, '\([^)]*\)')
+    if ($aces.Count -eq 0) {
+        return $false
+    }
+    foreach ($ace in $aces) {
+        if ($ace.Value -notmatch ';;;(SY|BA)\)$') {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Capture-CommandProcessorDacl {
@@ -617,6 +633,10 @@ function Restore-CommandProcessorDacl {
 }
 
 function Write-InstallRecoveryFile {
+    if ($Script:InstallRecoveryFailed) {
+        Write-Log "Left the existing recovery file unchanged because a previous copy was not fully restored."
+        return
+    }
     $autorun = New-Object System.Collections.Generic.List[object]
     foreach ($saved in $Script:SavedAutoRunValues) {
         $autorun.Add([pscustomobject]@{
@@ -707,10 +727,12 @@ function Import-InstallRecoveryFile {
             Write-Log "FAIL import user ComSpec: $($_.Exception.Message). Previous value: $($comSpecProperty.Value)"
         }
     }
-    if (-not $failed) {
-        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
-        Write-Log "Restored values saved by an interrupted install."
+    if ($failed) {
+        $Script:InstallRecoveryFailed = $true
+        return
     }
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    Write-Log "Restored values saved by an interrupted install."
 }
 
 function Remove-InstallRecoveryFile {
