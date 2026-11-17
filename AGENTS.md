@@ -11,7 +11,7 @@ List of packages to install on windows with chocolatey.
 Run commands from the repository root unless the component documentation says otherwise. Configure local dependencies and test services before application tests.
 
 - `git diff --check` — check whitespace in documentation and configuration changes.
-- `pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.0.0; Invoke-Pester -Path ./tests"` — parse-check the scripts and the Chocolatey package list without executing `install.ps1`.
+- `pwsh -NoProfile -Command 'Import-Module Pester -MinimumVersion 5.0.0; $result = Invoke-Pester -Path ./tests -PassThru; if ($result.FailedCount -gt 0) { exit 1 }'` — parse-check the scripts and the Chocolatey package list without executing `install.ps1`. A failing test exits non-zero.
 - Cloud agent VMs are Linux. Do not run `install.ps1` there. See README [Cloud agent environment](README.md#cloud-agent-environment). Chocolatey (`choco`) is not available on that VM.
 
 ## Coding and Testing

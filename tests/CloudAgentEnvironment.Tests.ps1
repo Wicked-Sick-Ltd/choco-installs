@@ -17,6 +17,8 @@ Describe 'Cloud agent environment' {
         $text = Get-Content -LiteralPath $path -Raw
         $text | Should -Match 'set -euo pipefail'
         $text | Should -Match "optional tool 'choco'"
+        $text | Should -Match 'Register-PSRepository -Default'
+        $text | Should -Not -Match 'Register-PSRepository -Name PSGallery'
         $invocations = Select-String -LiteralPath $path -Pattern 'install\.ps1' |
             Where-Object { $_.Line -match '\b(pwsh|powershell|bash)\b' -and $_.Line -notmatch 'WARNING' }
         @($invocations).Count | Should -Be 0

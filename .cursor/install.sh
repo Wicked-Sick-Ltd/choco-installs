@@ -32,6 +32,10 @@ install_pwsh() {
 
   # shellcheck disable=SC1091
   . /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    echo "PowerShell packages.microsoft.com install expects Ubuntu. This image is ${ID:-unknown} ${VERSION_ID:-unknown}." >&2
+    return 1
+  fi
   if [[ -z "${VERSION_ID:-}" ]]; then
     echo "Ubuntu VERSION_ID is unset; cannot register the Microsoft package repository." >&2
     return 1
@@ -89,11 +93,10 @@ if (-not $nuget) {
 Import-PackageProvider -Name NuGet -Force | Out-Null
 $gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
 if (-not $gallery) {
-    Register-PSRepository -Name PSGallery -SourceLocation 'https://www.powershellgallery.com/api/v2' -InstallationPolicy Trusted
+    # The gallery name is reserved. -Default is the supported way to create it.
+    Register-PSRepository -Default
 }
-else {
-    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-}
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
 
 $required = @(
     @{ Name = 'PSScriptAnalyzer' }
