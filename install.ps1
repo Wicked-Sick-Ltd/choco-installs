@@ -127,6 +127,79 @@ function Use-ProtectedTemp {
     $env:TMP = $ProtectedTemp
 }
 
+# The bootstrap and choco inherit this process environment, including values a
+# medium-integrity process put in the user environment. Keep Chocolatey's own
+# location variables on the machine value for the duration of the installs.
+$Script:HadChocolateyInstall = $false
+$Script:OriginalChocolateyInstall = $null
+$Script:HadChocolateyDownloadUrl = $false
+$Script:OriginalChocolateyDownloadUrl = $null
+
+function Save-ChocolateyProcessVariables {
+    $Script:HadChocolateyInstall = Test-Path -Path Env:ChocolateyInstall
+    if ($Script:HadChocolateyInstall) {
+        $Script:OriginalChocolateyInstall = $env:ChocolateyInstall
+    }
+    $Script:HadChocolateyDownloadUrl = Test-Path -Path Env:chocolateyDownloadUrl
+    if ($Script:HadChocolateyDownloadUrl) {
+        $Script:OriginalChocolateyDownloadUrl = $env:chocolateyDownloadUrl
+    }
+}
+
+function Use-MachineChocolateyVariables {
+    foreach ($name in @('ChocolateyInstall', 'chocolateyDownloadUrl')) {
+        $machine = $null
+        try {
+            $machine = [System.Environment]::GetEnvironmentVariable($name, 'Machine')
+        }
+        catch {
+            $machine = $null
+        }
+        if ([string]::IsNullOrEmpty($machine)) {
+            if (Test-Path -Path "Env:$name") {
+                Remove-Item -Path "Env:$name"
+            }
+        }
+        else {
+            Set-Item -Path "Env:$name" -Value $machine
+        }
+    }
+}
+
+function Restore-ChocolateyProcessVariables {
+    if ($Script:HadChocolateyInstall) {
+        $env:ChocolateyInstall = $Script:OriginalChocolateyInstall
+    }
+    elseif (Test-Path -Path Env:ChocolateyInstall) {
+        Remove-Item -Path Env:ChocolateyInstall
+    }
+    if ($Script:HadChocolateyDownloadUrl) {
+        $env:chocolateyDownloadUrl = $Script:OriginalChocolateyDownloadUrl
+    }
+    elseif (Test-Path -Path Env:chocolateyDownloadUrl) {
+        Remove-Item -Path Env:chocolateyDownloadUrl
+    }
+}
+
+function Restore-InstallEnvironment {
+    if ($null -ne $OriginalTemp) {
+        $env:TEMP = $OriginalTemp
+    }
+    elseif (Test-Path -Path Env:TEMP) {
+        Remove-Item -Path Env:TEMP
+    }
+    if ($null -ne $OriginalTmp) {
+        $env:TMP = $OriginalTmp
+    }
+    elseif (Test-Path -Path Env:TMP) {
+        Remove-Item -Path Env:TMP
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ProtectedTemp) -and (Test-Path -LiteralPath $ProtectedTemp)) {
+        Remove-Item -LiteralPath $ProtectedTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Restore-ChocolateyProcessVariables
+}
+
 $OriginalTemp = $env:TEMP
 $OriginalTmp = $env:TMP
 try {
@@ -137,7 +210,30 @@ catch {
     throw "Unable to create a temp directory that only SYSTEM and Administrators can write. Run this script from an elevated PowerShell session. $($_.Exception.Message)"
 }
 Write-Log "Using protected temp directory: $ProtectedTemp"
+Save-ChocolateyProcessVariables
+
+try {
+    # A statement-terminating error inside try would otherwise skip the rest of
+    # this block. continue keeps the previous per-statement behaviour. Stopping
+    # the pipeline still leaves the block so finally can restore TEMP and
+    # remove the directory.
+    trap {
+        $exception = $_.Exception
+        $stopped = $_.FullyQualifiedErrorId -eq 'PipelineStopped'
+        while ($null -ne $exception -and -not $stopped) {
+            if ($exception -is [System.Management.Automation.PipelineStoppedException] -or $exception -is [System.OperationCanceledException]) {
+                $stopped = $true
+            }
+            $exception = $exception.InnerException
+        }
+        if ($stopped) {
+            throw
+        }
+        continue
+    }
+
 Use-ProtectedTemp
+Use-MachineChocolateyVariables
 
 # 1. Install Chocolatey (run in an elevated PowerShell)
 Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
@@ -259,8 +355,10 @@ foreach ($pkg in $packages) {
     Write-Log "BEGIN install: $pkg"
 
     # Chocolatey's setup can reload session variables from the registry, which
-    # would put TEMP back on the user's profile.
+    # would put TEMP back on the user's profile and could bring back a user
+    # ChocolateyInstall or download URL.
     Use-ProtectedTemp
+    Use-MachineChocolateyVariables
     $output = & choco install -y $pkg 2>&1
     $exitCode = $LASTEXITCODE
 
@@ -278,10 +376,16 @@ foreach ($pkg in $packages) {
         $failedPackages.Add($pkg) | Out-Null
     }
 }
-
-$env:TEMP = $OriginalTemp
-$env:TMP = $OriginalTmp
-Remove-Item -LiteralPath $ProtectedTemp -Recurse -Force -ErrorAction SilentlyContinue
+}
+finally {
+    try {
+        Restore-InstallEnvironment
+    }
+    catch {
+        Write-Warning "Unable to restore TEMP or remove the protected temp directory. Error: $($_.Exception.Message)"
+        Write-Log "FAIL restore install environment: $($_.Exception.Message)"
+    }
+}
 
 Write-Host ""
 Write-Host "Install run complete." -ForegroundColor Cyan
