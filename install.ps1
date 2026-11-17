@@ -366,8 +366,18 @@ foreach ($pkg in $packages) {
         # ChocolateyInstall or download URL.
         Use-ProtectedTemp
         Use-MachineChocolateyVariables
-        $output = & choco install -y $pkg 2>&1
-        $exitCode = $LASTEXITCODE
+        # Chocolatey's bootstrap often leaves ErrorAction Stop. Under Stop,
+        # 2>&1 turns choco's own stderr into a terminating error on Windows
+        # PowerShell 5.1 even when the install succeeded.
+        $previousErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = & choco install -y $pkg 2>&1
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorAction
+        }
 
         if ($UseLogging) {
             Add-Content -Path $LogPath -Value $output
