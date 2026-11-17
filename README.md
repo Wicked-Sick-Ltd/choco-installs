@@ -58,6 +58,10 @@ If script execution is blocked, PowerShell can show an error similar to:
 - Pin versions for mission-critical tools when reproducibility matters.
 - Run in an elevated PowerShell when package installs require admin rights.
 
+## Cloud agent environment
+
+Cursor Cloud Agents run on Linux. `.cursor/install.sh` installs PowerShell 7, PSScriptAnalyzer, and Pester so agents can parse-check and lint the scripts in this repo. Chocolatey (`choco`) cannot run on the Linux VM. `install.ps1` is a Windows bootstrap and is not executed there. No secret environment variables are required.
+
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
