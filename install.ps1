@@ -50,7 +50,10 @@ function Write-Log {
 # non-elevated process of the logged-on user can write the HKCU value, so every
 # key on the path cmd.exe opens gets a High integrity no-write-up label before
 # the values are removed: Medium integrity processes then cannot re-create the
-# value or rename/replace those keys until the label is removed after the loop.
+# value or rename/replace those keys. The HKCU Command Processor key is replaced
+# so a handle opened before the run cannot write through it. Saved AutoRun
+# values and the user ComSpec value are restored from a finally block, including
+# when the run is stopped, and the labels are removed there too.
 $AutoRunKeyPaths = @(
     'HKLM:\Software\Microsoft\Command Processor',
     'HKLM:\Software\WOW6432Node\Microsoft\Command Processor',
@@ -82,6 +85,25 @@ public static class RegistryIntegrityLabel
     [DllImport("kernel32.dll")]
     static extern IntPtr LocalFree(IntPtr memory);
 
+    const int HKEY_CURRENT_USER = unchecked((int)0x80000001);
+    const int KEY_QUERY_VALUE = 0x0001;
+    const int DELETE = 0x00010000;
+    const int REG_OPTION_OPEN_LINK = 0x0008;
+    const int REG_LINK = 6;
+
+    // Opening a registry link without this option follows it and would delete the target.
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern int RegOpenKeyEx(IntPtr key, string subKey, int options, int desired, out IntPtr result);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern int RegQueryValueEx(IntPtr key, string name, IntPtr reserved, out int type, IntPtr data, ref int length);
+
+    [DllImport("ntdll.dll")]
+    static extern int NtDeleteKey(IntPtr key);
+
+    [DllImport("advapi32.dll")]
+    static extern int RegCloseKey(IntPtr key);
+
     public static void Set(RegistryKey key, string sddl)
     {
         IntPtr descriptor;
@@ -93,6 +115,36 @@ public static class RegistryIntegrityLabel
             if (status != 0) throw new Win32Exception(status);
         }
         finally { LocalFree(descriptor); }
+    }
+
+    public static bool IsSymbolicLink(string subKey)
+    {
+        IntPtr handle;
+        int status = RegOpenKeyEx(new IntPtr(HKEY_CURRENT_USER), subKey, REG_OPTION_OPEN_LINK, KEY_QUERY_VALUE, out handle);
+        if (status != 0) return false;
+        try
+        {
+            int type = 0;
+            int length = 0;
+            // A null buffer returns ERROR_MORE_DATA (234) when the value exists, with the type filled in.
+            status = RegQueryValueEx(handle, "SymbolicLinkValue", IntPtr.Zero, out type, IntPtr.Zero, ref length);
+            return (status == 0 || status == 234) && type == REG_LINK;
+        }
+        finally { RegCloseKey(handle); }
+    }
+
+    // Deletes the link key itself. .NET DeleteSubKey follows the link.
+    public static void DeleteSymbolicLink(string subKey)
+    {
+        IntPtr handle;
+        int status = RegOpenKeyEx(new IntPtr(HKEY_CURRENT_USER), subKey, REG_OPTION_OPEN_LINK, DELETE, out handle);
+        if (status != 0) throw new Win32Exception(status);
+        try
+        {
+            status = NtDeleteKey(handle);
+            if (status != 0) throw new Win32Exception("Deleting the registry link failed with status 0x" + status.ToString("X8"));
+        }
+        finally { RegCloseKey(handle); }
     }
 }
 '@
@@ -130,6 +182,197 @@ function Unlock-UserAutoRunKeyChain {
             Write-Warning "Unable to remove the integrity label from HKCU\$subKey. Error: $($_.Exception.Message)"
             Write-Log "FAIL remove integrity label: HKCU\$subKey"
         }
+    }
+}
+
+# Saved before AutoRun is removed and written back from the finally block, including
+# when the run is stopped. The value itself is logged only if the restore fails.
+$Script:SavedAutoRunValues = New-Object System.Collections.Generic.List[object]
+$Script:UserComSpecSuspended = $false
+$Script:HadUserComSpec = $false
+$Script:SavedUserComSpec = $null
+$Script:ReplacedCommandProcessorLink = $false
+
+function Save-CommandProcessorAutoRunValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $property = Get-ItemProperty -Path $Path -Name AutoRun -ErrorAction SilentlyContinue
+    if ($null -eq $property) {
+        return
+    }
+
+    $value = $property.AutoRun
+    $kind = [Microsoft.Win32.RegistryValueKind]::String
+    $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -ne $key -and $null -ne $key.PSObject.Methods['GetValueKind']) {
+        try {
+            $kind = $key.GetValueKind('AutoRun')
+            $raw = $key.GetValue('AutoRun', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($null -ne $raw) {
+                $value = $raw
+            }
+        }
+        catch {
+            Write-Warning "Could not read the kind of the AutoRun value at $Path. It will be restored as a string."
+            Write-Log "WARN AutoRun kind unreadable at $Path; restoring as a string."
+        }
+        finally {
+            if ($null -ne $key.PSObject.Methods['Close']) {
+                $key.Close()
+            }
+        }
+    }
+
+    $Script:SavedAutoRunValues.Add([pscustomobject]@{
+            Path  = $Path
+            Kind  = $kind
+            Value = $value
+        }) | Out-Null
+    Write-Warning "Temporarily removing the cmd.exe AutoRun value from $Path so it cannot run with administrator rights. It will be restored when this script ends."
+    Write-Log "Temporarily removing AutoRun from $Path; it will be restored when the script ends."
+}
+
+function Restore-CommandProcessorAutoRunValues {
+    # @() on List[object] throws "Argument types do not match" under StrictMode.
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($saved in $Script:SavedAutoRunValues) {
+        $pending.Add($saved) | Out-Null
+    }
+    $Script:SavedAutoRunValues.Clear()
+    foreach ($saved in $pending) {
+        try {
+            if (-not (Test-Path -LiteralPath $saved.Path)) {
+                New-Item -Path $saved.Path -Force -ErrorAction Stop | Out-Null
+            }
+            $typeName = [string]$saved.Kind
+            if ([string]::IsNullOrWhiteSpace($typeName) -or $typeName -eq 'Unknown' -or $typeName -eq 'None') {
+                $typeName = 'String'
+            }
+            New-ItemProperty -Path $saved.Path -Name AutoRun -Value $saved.Value -PropertyType $typeName -Force -ErrorAction Stop | Out-Null
+            Write-Log "Restored AutoRun at $($saved.Path)"
+        }
+        catch {
+            $shown = $saved.Value
+            if ($shown -is [byte[]]) {
+                $shown = [System.BitConverter]::ToString([byte[]]$shown)
+            }
+            elseif ($shown -is [Array]) {
+                $shown = $shown -join '|'
+            }
+            Write-Warning "Unable to restore cmd.exe AutoRun at $($saved.Path). Set it again to: $shown"
+            Write-Log "FAIL restore AutoRun at $($saved.Path): $($_.Exception.Message). Previous value: $shown"
+        }
+    }
+}
+
+function Suspend-UserComSpec {
+    # Chocolatey's environment refresh loads the User scope after this process,
+    # which would replace the ComSpec pin. Hold the user value for the run and
+    # label the key so a medium-integrity process cannot write it back.
+    $Script:UserComSpecSuspended = $true
+    $current = [System.Environment]::GetEnvironmentVariable('ComSpec', 'User')
+    if (-not [string]::IsNullOrEmpty($current)) {
+        $Script:SavedUserComSpec = $current
+        $Script:HadUserComSpec = $true
+        [System.Environment]::SetEnvironmentVariable('ComSpec', $null, 'User')
+        Write-Warning "Temporarily removing the user ComSpec value so package installs cannot be redirected. It will be restored when this script ends."
+        Write-Log "Temporarily removed the user ComSpec value; it will be restored when the script ends."
+    }
+    [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment').Close()
+    Set-UserKeyIntegrityLabel -SubKey 'Environment' -Label 'S:(ML;;NW;;;HI)'
+}
+
+function Resume-UserComSpec {
+    if (-not $Script:UserComSpecSuspended) {
+        return
+    }
+    try {
+        Set-UserKeyIntegrityLabel -SubKey 'Environment' -Label 'S:'
+    }
+    catch {
+        Write-Warning "Unable to remove the integrity label from HKCU\Environment. Error: $($_.Exception.Message)"
+        Write-Log "FAIL remove integrity label: HKCU\Environment"
+    }
+    if ($Script:HadUserComSpec) {
+        try {
+            [System.Environment]::SetEnvironmentVariable('ComSpec', $Script:SavedUserComSpec, 'User')
+            Write-Log "Restored the user ComSpec value."
+        }
+        catch {
+            Write-Warning "Unable to restore the user ComSpec value. Set it again to: $($Script:SavedUserComSpec)"
+            Write-Log "FAIL restore user ComSpec: $($_.Exception.Message). Previous value: $($Script:SavedUserComSpec)"
+        }
+    }
+    $Script:UserComSpecSuspended = $false
+    $Script:HadUserComSpec = $false
+    $Script:SavedUserComSpec = $null
+}
+
+function Protect-UserCommandProcessorKey {
+    $relative = 'Software\Microsoft\Command Processor'
+    $hive = [Microsoft.Win32.Registry]::CurrentUser
+
+    # A link would send a later delete at the target. Replace the link itself.
+    if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
+        [RegistryIntegrityLabel]::DeleteSymbolicLink($relative)
+        $hive.CreateSubKey($relative).Close()
+        Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
+        $Script:ReplacedCommandProcessorLink = $true
+        Write-Warning "Replaced the registry link at HKCU\$relative so an existing handle cannot set AutoRun."
+        Write-Log "Replaced registry link: HKCU\$relative"
+        return
+    }
+
+    $preserved = New-Object System.Collections.Generic.List[object]
+    $existing = $hive.OpenSubKey($relative)
+    if ($null -ne $existing) {
+        try {
+            if ($existing.GetSubKeyNames().Length -gt 0) {
+                throw "HKCU\$relative has subkeys, so it cannot be replaced without deleting them."
+            }
+            foreach ($name in $existing.GetValueNames()) {
+                if ($name -eq 'AutoRun') {
+                    continue
+                }
+                $preserved.Add([pscustomobject]@{
+                        Name  = $name
+                        Kind  = $existing.GetValueKind($name)
+                        Value = $existing.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    }) | Out-Null
+            }
+        }
+        finally {
+            $existing.Close()
+        }
+        # Deletes the key object. Handles opened earlier fail with ERROR_KEY_DELETED.
+        $hive.DeleteSubKey($relative, $true)
+    }
+
+    $created = $hive.CreateSubKey($relative)
+    try {
+        foreach ($item in $preserved) {
+            if ($null -eq $item.Value) {
+                continue
+            }
+            $created.SetValue($item.Name, $item.Value, $item.Kind)
+        }
+    }
+    finally {
+        $created.Close()
+    }
+    Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
+}
+
+function Restore-InstallGuards {
+    if ($OnWindows) {
+        Unlock-UserAutoRunKeyChain
+    }
+    Restore-CommandProcessorAutoRunValues
+    if ($OnWindows) {
+        Resume-UserComSpec
     }
 }
 
@@ -171,19 +414,26 @@ try {
         # system() starts %ComSpec%, which a per-user environment variable can override.
         $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
 
-        foreach ($subKey in $UserAutoRunKeyChain) {
+        foreach ($subKey in @('Software', 'Software\Microsoft')) {
             [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey).Close()
             Set-UserKeyIntegrityLabel -SubKey $subKey -Label 'S:(ML;;NW;;;HI)'
         }
-        Write-Host "HKCU\Software\Microsoft\Command Processor and its parent keys are read-only to non-elevated processes until the package installs finish. If this run is interrupted, run install.ps1 again to restore them." -ForegroundColor Cyan
+        # Replace a link before any provider read, which would follow it.
+        if ([RegistryIntegrityLabel]::IsSymbolicLink('Software\Microsoft\Command Processor')) {
+            Protect-UserCommandProcessorKey
+        }
+        Suspend-UserComSpec
+        Write-Host "HKCU\Software\Microsoft\Command Processor and its parent keys are read-only to non-elevated processes until the package installs finish. Existing AutoRun values are restored when the script ends, including if it is stopped early." -ForegroundColor Cyan
     }
 
     foreach ($autoRunKeyPath in $AutoRunKeyPaths) {
-        if ($null -ne (Get-ItemProperty -Path $autoRunKeyPath -Name AutoRun -ErrorAction SilentlyContinue)) {
-            Write-Warning "Removing the cmd.exe AutoRun value from $autoRunKeyPath so it cannot run with administrator rights."
-            Write-Log "Removing AutoRun from $autoRunKeyPath"
-        }
+        Save-CommandProcessorAutoRunValue -Path $autoRunKeyPath
         Remove-ItemProperty -Path $autoRunKeyPath -Name AutoRun -ErrorAction SilentlyContinue
+    }
+
+    if ($OnWindows -and -not $Script:ReplacedCommandProcessorLink) {
+        # After the value is saved: drop the key object so an already-open handle cannot write it back.
+        Protect-UserCommandProcessorKey
     }
 
     if ($OnWindows) {
@@ -191,12 +441,38 @@ try {
     }
 }
 catch {
-    Write-Log "ABORT: unable to remove cmd.exe AutoRun before installing packages: $($_.Exception.Message)"
-    if ($OnWindows) {
-        Unlock-UserAutoRunKeyChain
+    $reason = $_.Exception.Message
+    Write-Log "ABORT: unable to remove cmd.exe AutoRun before installing packages: $reason"
+    # A statement-terminating error here would skip the refusal and continue
+    # into the package installs. Keep that error inside its own handler.
+    try {
+        Restore-InstallGuards
     }
-    throw "Refusing to install packages while cmd.exe AutoRun could run with administrator rights. $($_.Exception.Message)"
+    catch {
+        Write-Warning "Unable to restore cmd.exe AutoRun after aborting the install. Error: $($_.Exception.Message)"
+        Write-Log "FAIL restore after abort: $($_.Exception.Message)"
+    }
+    throw "Refusing to install packages while cmd.exe AutoRun could run with administrator rights. $reason"
 }
+
+try {
+    # A statement-terminating error inside try would otherwise skip the rest of
+    # this block. continue keeps the previous per-statement behaviour. Stopping
+    # the pipeline (Ctrl+C) still leaves the block so finally can unlock.
+    trap {
+        $exception = $_.Exception
+        $stopped = $_.FullyQualifiedErrorId -eq 'PipelineStopped'
+        while ($null -ne $exception -and -not $stopped) {
+            if ($exception -is [System.Management.Automation.PipelineStoppedException] -or $exception -is [System.OperationCanceledException]) {
+                $stopped = $true
+            }
+            $exception = $exception.InnerException
+        }
+        if ($stopped) {
+            throw
+        }
+        continue
+    }
 
 # 1. Install Chocolatey (run in an elevated PowerShell)
 Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
@@ -316,6 +592,11 @@ Write-Host "Installing $($packages.Count) package(s)..." -ForegroundColor Cyan
 Write-Log "Installing $($packages.Count) package(s): $($packages -join ', ')"
 
 foreach ($pkg in $packages) {
+    if ($OnWindows) {
+        # A package script may have reloaded session variables. Pin this again
+        # before the next installer starts cmd.exe.
+        $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
+    }
     Write-Host "==> Installing $pkg" -ForegroundColor Yellow
     Write-Log "BEGIN install: $pkg"
 
@@ -336,9 +617,15 @@ foreach ($pkg in $packages) {
         $failedPackages.Add($pkg) | Out-Null
     }
 }
-
-if ($OnWindows) {
-    Unlock-UserAutoRunKeyChain
+}
+finally {
+    try {
+        Restore-InstallGuards
+    }
+    catch {
+        Write-Warning "Unable to restore cmd.exe AutoRun or remove the integrity labels. Error: $($_.Exception.Message)"
+        Write-Log "FAIL restore at end: $($_.Exception.Message)"
+    }
 }
 
 Write-Host ""
