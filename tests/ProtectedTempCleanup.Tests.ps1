@@ -78,8 +78,10 @@ function Invoke-InstallUnderTest {
         Microsoft.PowerShell.Utility\New-Object @forward
     }
 
-    if (-not $NoChoco) {
     function choco {
+        if ($NoChoco) {
+            throw (New-Object System.Management.Automation.CommandNotFoundException "The term 'choco' is not recognized as the name of a cmdlet, function, script file, or operable program.")
+        }
         $package = $null
         for ($i = 0; $i -lt $args.Count; $i++) {
             if ([string]$args[$i] -eq '-y' -and ($i + 1) -lt $args.Count) {
@@ -94,7 +96,6 @@ function Invoke-InstallUnderTest {
             throw (New-Object System.Management.Automation.PipelineStoppedException)
         }
         $global:LASTEXITCODE = 0
-    }
     }
 
     $failed = $false
