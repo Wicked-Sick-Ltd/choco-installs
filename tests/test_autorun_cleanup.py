@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+RECOVERY_NAME = "choco-installs-autorun-recovery.json"
+
 
 REPO = Path(__file__).resolve().parents[1]
 HARNESS = Path(__file__).resolve().parent / "Invoke-AutoRunCleanup.ps1"
@@ -42,16 +44,30 @@ def find_pwsh() -> str:
 
 
 class AutoRunCleanupTests(unittest.TestCase):
-    def run_install(self, extra_env: dict | None = None) -> tuple[subprocess.CompletedProcess[str], dict, list[str]]:
+    def recovery_path(self) -> Path:
+        return Path(tempfile.gettempdir()) / RECOVERY_NAME
+
+    def run_install(
+        self,
+        extra_env: dict | None = None,
+        registry: dict | None = None,
+        recovery: dict | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], dict, list[str]]:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             registry_path = root / "autorun.json"
             invocation_log = root / "choco.txt"
-            registry_path.write_text(json.dumps(ORIGINAL))
+            registry_path.write_text(json.dumps(ORIGINAL if registry is None else registry))
+            recovery_path = self.recovery_path()
+            if recovery_path.exists():
+                recovery_path.unlink()
+            if recovery is not None:
+                recovery_path.write_text(json.dumps(recovery))
             env = os.environ.copy()
             env.pop("CHOCO_TEST_ABORT_REMOVE", None)
             env.pop("CHOCO_TEST_STOP_AT", None)
             env.pop("CHOCO_TEST_BOOTSTRAP_FAIL", None)
+            env.pop("CHOCO_TEST_NO_CHOCO", None)
             if extra_env:
                 env.update(extra_env)
             proc = subprocess.run(
@@ -132,6 +148,37 @@ class AutoRunCleanupTests(unittest.TestCase):
         self.assertIn("install vim present=0", log)
         self.assertIn("install cascadia-code-nerd-font present=0", log)
         self.assert_restored(restored)
+
+    def test_missing_choco_is_a_per_package_failure(self):
+        proc, restored, log = self.run_install({"CHOCO_TEST_NO_CHOCO": "1"})
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"a missing choco command aborted the script\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+        )
+        output = proc.stdout + proc.stderr
+        self.assertIn("==> Installing googlechrome", output)
+        self.assertIn("==> Installing cascadia-code-nerd-font", output)
+        self.assertIn("Some package installs failed", output)
+        self.assertNotIn("All packages installed successfully", output)
+        self.assertEqual(log, [])
+        self.assert_restored(restored)
+        self.assertFalse(self.recovery_path().exists(), "recovery file was left after a finished run")
+
+    def test_next_run_restores_values_saved_by_a_killed_process(self):
+        empty = {HKLM: None, HKLM_WOW: None, HKCU: None}
+        recovery = {
+            "autorun": [
+                {"path": HKLM, "kind": "String", "value": "echo stay-hklm"},
+                {"path": HKCU, "kind": "ExpandString", "value": r"echo %SystemRoot%\stay"},
+            ],
+            "userComSpec": None,
+        }
+        proc, restored, log = self.run_install(registry=empty, recovery=recovery)
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assert_absent_during_installs(log)
+        self.assert_restored(restored)
+        self.assertFalse(self.recovery_path().exists())
 
 
 if __name__ == "__main__":

@@ -104,6 +104,17 @@ public static class RegistryIntegrityLabel
     [DllImport("advapi32.dll")]
     static extern int RegCloseKey(IntPtr key);
 
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern int RegCreateKeyEx(IntPtr key, string subKey, int reserved, string className, int options, int desired, IntPtr security, out IntPtr result, out int disposition);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SecurityAttributes
+    {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        public int InheritHandle;
+    }
+
     public static void Set(RegistryKey key, string sddl)
     {
         IntPtr descriptor;
@@ -145,6 +156,33 @@ public static class RegistryIntegrityLabel
             if (status != 0) throw new Win32Exception("Deleting the registry link failed with status 0x" + status.ToString("X8"));
         }
         finally { RegCloseKey(handle); }
+    }
+
+    // The label is part of the create, so the new key is never opened while it has no label.
+    public static void CreateWithLabel(string subKey, string sddl)
+    {
+        IntPtr descriptor;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, out descriptor, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        try
+        {
+            SecurityAttributes attributes = new SecurityAttributes();
+            attributes.Length = Marshal.SizeOf(typeof(SecurityAttributes));
+            attributes.SecurityDescriptor = descriptor;
+            attributes.InheritHandle = 0;
+            IntPtr buffer = Marshal.AllocHGlobal(attributes.Length);
+            try
+            {
+                Marshal.StructureToPtr(attributes, buffer, false);
+                IntPtr handle;
+                int disposition;
+                int status = RegCreateKeyEx(new IntPtr(HKEY_CURRENT_USER), subKey, 0, null, 0, 0xF003F, buffer, out handle, out disposition);
+                if (status != 0) throw new Win32Exception(status);
+                RegCloseKey(handle);
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+        finally { LocalFree(descriptor); }
     }
 }
 '@
@@ -192,6 +230,7 @@ $Script:UserComSpecSuspended = $false
 $Script:HadUserComSpec = $false
 $Script:SavedUserComSpec = $null
 $Script:ReplacedCommandProcessorLink = $false
+$Script:InstallRecoveryFailed = $false
 
 function Save-CommandProcessorAutoRunValue {
     param(
@@ -262,6 +301,7 @@ function Restore-CommandProcessorAutoRunValues {
             elseif ($shown -is [Array]) {
                 $shown = $shown -join '|'
             }
+            $Script:InstallRecoveryFailed = $true
             Write-Warning "Unable to restore cmd.exe AutoRun at $($saved.Path). Set it again to: $shown"
             Write-Log "FAIL restore AutoRun at $($saved.Path): $($_.Exception.Message). Previous value: $shown"
         }
@@ -269,20 +309,41 @@ function Restore-CommandProcessorAutoRunValues {
 }
 
 function Suspend-UserComSpec {
-    # Chocolatey's environment refresh loads the User scope after this process,
-    # which would replace the ComSpec pin. Hold the user value for the run and
-    # label the key so a medium-integrity process cannot write it back.
+    # Label the key before the value is read or cleared. A write in the gap
+    # between a delete and a later label would otherwise stick.
     $Script:UserComSpecSuspended = $true
+    [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment').Close()
+    Set-UserKeyIntegrityLabel -SubKey 'Environment' -Label 'S:(ML;;NW;;;HI)'
     $current = [System.Environment]::GetEnvironmentVariable('ComSpec', 'User')
     if (-not [string]::IsNullOrEmpty($current)) {
         $Script:SavedUserComSpec = $current
         $Script:HadUserComSpec = $true
-        [System.Environment]::SetEnvironmentVariable('ComSpec', $null, 'User')
-        Write-Warning "Temporarily removing the user ComSpec value so package installs cannot be redirected. It will be restored when this script ends."
-        Write-Log "Temporarily removed the user ComSpec value; it will be restored when the script ends."
     }
-    [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment').Close()
-    Set-UserKeyIntegrityLabel -SubKey 'Environment' -Label 'S:(ML;;NW;;;HI)'
+}
+
+function Clear-CapturedUserComSpec {
+    if (-not $Script:HadUserComSpec) {
+        return
+    }
+    [System.Environment]::SetEnvironmentVariable('ComSpec', $null, 'User')
+    Write-Warning "Temporarily removing the user ComSpec value so package installs cannot be redirected. It will be restored when this script ends."
+    Write-Log "Temporarily removed the user ComSpec value; it will be restored when the script ends."
+    $remaining = [System.Environment]::GetEnvironmentVariable('ComSpec', 'User')
+    if (-not [string]::IsNullOrEmpty($remaining)) {
+        throw "User ComSpec is set and could not be cleared."
+    }
+}
+
+function Assert-UserComSpecStillClear {
+    $current = [System.Environment]::GetEnvironmentVariable('ComSpec', 'User')
+    if ([string]::IsNullOrEmpty($current)) {
+        return
+    }
+    [System.Environment]::SetEnvironmentVariable('ComSpec', $null, 'User')
+    $current = [System.Environment]::GetEnvironmentVariable('ComSpec', 'User')
+    if (-not [string]::IsNullOrEmpty($current)) {
+        throw "User ComSpec is set and could not be cleared."
+    }
 }
 
 function Resume-UserComSpec {
@@ -302,6 +363,7 @@ function Resume-UserComSpec {
             Write-Log "Restored the user ComSpec value."
         }
         catch {
+            $Script:InstallRecoveryFailed = $true
             Write-Warning "Unable to restore the user ComSpec value. Set it again to: $($Script:SavedUserComSpec)"
             Write-Log "FAIL restore user ComSpec: $($_.Exception.Message). Previous value: $($Script:SavedUserComSpec)"
         }
@@ -318,7 +380,8 @@ function Protect-UserCommandProcessorKey {
     # A link would send a later delete at the target. Replace the link itself.
     if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
         [RegistryIntegrityLabel]::DeleteSymbolicLink($relative)
-        $hive.CreateSubKey($relative).Close()
+        # DACL for SYSTEM and Administrators, plus the High no-write-up label, in the create itself.
+        [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)S:(ML;;NW;;;HI)')
         Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
         $Script:ReplacedCommandProcessorLink = $true
         Write-Warning "Replaced the registry link at HKCU\$relative so an existing handle cannot set AutoRun."
@@ -351,7 +414,11 @@ function Protect-UserCommandProcessorKey {
         $hive.DeleteSubKey($relative, $true)
     }
 
-    $created = $hive.CreateSubKey($relative)
+    [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)S:(ML;;NW;;;HI)')
+    $created = $hive.OpenSubKey($relative, $true)
+    if ($null -eq $created) {
+        throw "HKCU\$relative could not be reopened after it was created."
+    }
     try {
         foreach ($item in $preserved) {
             if ($null -eq $item.Value) {
@@ -366,6 +433,117 @@ function Protect-UserCommandProcessorKey {
     Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
 }
 
+function Get-InstallRecoveryPath {
+    if ($OnWindows) {
+        $parent = [System.Environment]::GetFolderPath('CommonApplicationData')
+        if ([string]::IsNullOrWhiteSpace($parent)) {
+            throw "Unable to resolve ProgramData for the AutoRun recovery file."
+        }
+        return Join-Path -Path $parent -ChildPath 'choco-installs-autorun-recovery.json'
+    }
+    return Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'choco-installs-autorun-recovery.json'
+}
+
+function Write-InstallRecoveryFile {
+    $autorun = New-Object System.Collections.Generic.List[object]
+    foreach ($saved in $Script:SavedAutoRunValues) {
+        $autorun.Add([pscustomobject]@{
+                path  = $saved.Path
+                kind  = [string]$saved.Kind
+                value = $saved.Value
+            }) | Out-Null
+    }
+    $payload = [pscustomobject]@{
+        autorun     = $autorun
+        userComSpec = $(if ($Script:HadUserComSpec) { $Script:SavedUserComSpec } else { $null })
+    }
+    $path = Get-InstallRecoveryPath
+    $json = $payload | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($path, $json)
+    if ($OnWindows) {
+        $security = New-Object System.Security.AccessControl.FileSecurity
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @(
+                [System.Security.Principal.WellKnownSidType]::LocalSystemSid,
+                [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid
+            )) {
+            $account = New-Object System.Security.Principal.SecurityIdentifier($sid, $null)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $account,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $security.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $path -AclObject $security
+    }
+    Write-Log "Wrote AutoRun and user ComSpec recovery file before removing the values."
+}
+
+function Import-InstallRecoveryFile {
+    $path = Get-InstallRecoveryPath
+    if (-not (Test-Path -LiteralPath $path)) {
+        return
+    }
+    $data = $null
+    try {
+        $data = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+    }
+    catch {
+        Write-Warning "A previous install left a recovery file that could not be read. It was kept. Error: $($_.Exception.Message)"
+        Write-Log "FAIL read recovery file: $($_.Exception.Message)"
+        return
+    }
+
+    $failed = $false
+    $entries = @()
+    if ($null -ne $data.autorun) {
+        $entries = @($data.autorun)
+    }
+    foreach ($saved in $entries) {
+        try {
+            if (-not (Test-Path -LiteralPath $saved.path)) {
+                New-Item -Path $saved.path -Force -ErrorAction Stop | Out-Null
+            }
+            $typeName = [string]$saved.kind
+            if ([string]::IsNullOrWhiteSpace($typeName) -or $typeName -eq 'Unknown' -or $typeName -eq 'None') {
+                $typeName = 'String'
+            }
+            New-ItemProperty -Path $saved.path -Name AutoRun -Value $saved.value -PropertyType $typeName -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $failed = $true
+            Write-Warning "Unable to restore cmd.exe AutoRun at $($saved.path) from the previous install. Set it again to: $($saved.value)"
+            Write-Log "FAIL import AutoRun at $($saved.path): $($_.Exception.Message). Previous value: $($saved.value)"
+        }
+    }
+    if ($null -ne $data.userComSpec -and -not [string]::IsNullOrEmpty([string]$data.userComSpec)) {
+        try {
+            [System.Environment]::SetEnvironmentVariable('ComSpec', [string]$data.userComSpec, 'User')
+            Write-Log "Restored the user ComSpec value from the previous install."
+        }
+        catch {
+            $failed = $true
+            Write-Warning "Unable to restore the user ComSpec value from the previous install. Set it again to: $($data.userComSpec)"
+            Write-Log "FAIL import user ComSpec: $($_.Exception.Message). Previous value: $($data.userComSpec)"
+        }
+    }
+    if (-not $failed) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        Write-Log "Restored values saved by an interrupted install."
+    }
+}
+
+function Remove-InstallRecoveryFile {
+    if ($Script:InstallRecoveryFailed) {
+        Write-Log "Left the AutoRun recovery file in place because a restore failed."
+        return
+    }
+    $path = Get-InstallRecoveryPath
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Restore-InstallGuards {
     if ($OnWindows) {
         Unlock-UserAutoRunKeyChain
@@ -374,6 +552,20 @@ function Restore-InstallGuards {
     if ($OnWindows) {
         Resume-UserComSpec
     }
+    Remove-InstallRecoveryFile
+}
+
+function Test-PipelineStop {
+    param($ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    $stopped = $ErrorRecord.FullyQualifiedErrorId -eq 'PipelineStopped'
+    while ($null -ne $exception -and -not $stopped) {
+        if ($exception -is [System.Management.Automation.PipelineStoppedException] -or $exception -is [System.OperationCanceledException]) {
+            $stopped = $true
+        }
+        $exception = $exception.InnerException
+    }
+    return $stopped
 }
 
 function Assert-NoCommandProcessorAutoRun {
@@ -410,6 +602,10 @@ function Assert-NoCommandProcessorAutoRun {
 }
 
 try {
+    # A killed process does not run finally. A previous run may have left the
+    # saved values in this file after deleting them from the registry.
+    Import-InstallRecoveryFile
+
     if ($OnWindows) {
         # system() starts %ComSpec%, which a per-user environment variable can override.
         $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
@@ -423,11 +619,17 @@ try {
             Protect-UserCommandProcessorKey
         }
         Suspend-UserComSpec
-        Write-Host "HKCU\Software\Microsoft\Command Processor and its parent keys are read-only to non-elevated processes until the package installs finish. Existing AutoRun values are restored when the script ends, including if it is stopped early." -ForegroundColor Cyan
+        Write-Host "HKCU\Software\Microsoft\Command Processor and its parent keys are read-only to non-elevated processes until the package installs finish. Existing AutoRun values are restored when the script ends. If the process is killed, the next run restores them from the recovery file." -ForegroundColor Cyan
     }
 
     foreach ($autoRunKeyPath in $AutoRunKeyPaths) {
         Save-CommandProcessorAutoRunValue -Path $autoRunKeyPath
+    }
+    Write-InstallRecoveryFile
+    if ($OnWindows) {
+        Clear-CapturedUserComSpec
+    }
+    foreach ($autoRunKeyPath in $AutoRunKeyPaths) {
         Remove-ItemProperty -Path $autoRunKeyPath -Name AutoRun -ErrorAction SilentlyContinue
     }
 
@@ -456,21 +658,14 @@ catch {
 }
 
 try {
-    # A statement-terminating error inside try would otherwise skip the rest of
-    # this block. continue keeps the previous per-statement behaviour. Stopping
-    # the pipeline (Ctrl+C) still leaves the block so finally can unlock.
+    # The trap covers the bootstrap statement. Each package has its own catch,
+    # because continue here resumes after the whole foreach, not the next package.
     trap {
-        $exception = $_.Exception
-        $stopped = $_.FullyQualifiedErrorId -eq 'PipelineStopped'
-        while ($null -ne $exception -and -not $stopped) {
-            if ($exception -is [System.Management.Automation.PipelineStoppedException] -or $exception -is [System.OperationCanceledException]) {
-                $stopped = $true
-            }
-            $exception = $exception.InnerException
-        }
-        if ($stopped) {
+        if (Test-PipelineStop $_) {
             throw
         }
+        Write-Warning "Continuing after an error: $($_.Exception.Message)"
+        Write-Log "CONTINUE after error: $($_.Exception.Message)"
         continue
     }
 
@@ -592,28 +787,39 @@ Write-Host "Installing $($packages.Count) package(s)..." -ForegroundColor Cyan
 Write-Log "Installing $($packages.Count) package(s): $($packages -join ', ')"
 
 foreach ($pkg in $packages) {
-    if ($OnWindows) {
-        # A package script may have reloaded session variables. Pin this again
-        # before the next installer starts cmd.exe.
-        $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
-    }
-    Write-Host "==> Installing $pkg" -ForegroundColor Yellow
-    Write-Log "BEGIN install: $pkg"
+    try {
+        if ($OnWindows) {
+            Assert-UserComSpecStillClear
+            # A package script may have reloaded session variables. Pin this again
+            # before the next installer starts cmd.exe.
+            $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
+        }
+        Write-Host "==> Installing $pkg" -ForegroundColor Yellow
+        Write-Log "BEGIN install: $pkg"
 
-    $output = & choco install -y $pkg 2>&1
-    $exitCode = $LASTEXITCODE
+        $output = & choco install -y $pkg 2>&1
+        $exitCode = $LASTEXITCODE
 
-    if ($UseLogging) {
-        Add-Content -Path $LogPath -Value $output
-    }
+        if ($UseLogging) {
+            Add-Content -Path $LogPath -Value $output
+        }
 
-    if ($exitCode -eq 0) {
-        Write-Host "✅ $pkg installed successfully" -ForegroundColor Green
-        Write-Log "SUCCESS install: $pkg (exit code $exitCode)"
+        if ($exitCode -eq 0) {
+            Write-Host "✅ $pkg installed successfully" -ForegroundColor Green
+            Write-Log "SUCCESS install: $pkg (exit code $exitCode)"
+        }
+        else {
+            Write-Warning "❌ $pkg failed (exit code $exitCode)"
+            Write-Log "FAIL install: $pkg (exit code $exitCode)"
+            $failedPackages.Add($pkg) | Out-Null
+        }
     }
-    else {
-        Write-Warning "❌ $pkg failed (exit code $exitCode)"
-        Write-Log "FAIL install: $pkg (exit code $exitCode)"
+    catch {
+        if ((Test-PipelineStop $_) -or $_.Exception.Message -like 'User ComSpec is set*') {
+            throw
+        }
+        Write-Warning "❌ $pkg failed: $($_.Exception.Message)"
+        Write-Log "FAIL install: $pkg ($($_.Exception.Message))"
         $failedPackages.Add($pkg) | Out-Null
     }
 }

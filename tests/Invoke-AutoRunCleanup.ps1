@@ -216,6 +216,7 @@ function New-ItemProperty {
     Write-Store $store
 }
 
+if ($env:CHOCO_TEST_NO_CHOCO -ne '1') {
 function choco {
     $package = $null
     for ($i = 0; $i -lt $args.Count; $i++) {
@@ -235,6 +236,7 @@ function choco {
         throw (New-Object System.Management.Automation.PipelineStoppedException)
     }
     $global:LASTEXITCODE = 0
+}
 }
 
 . $InstallScript
