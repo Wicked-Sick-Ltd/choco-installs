@@ -200,6 +200,19 @@ function Restore-InstallEnvironment {
     Restore-ChocolateyProcessVariables
 }
 
+function Test-PipelineStop {
+    param($ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    $stopped = $ErrorRecord.FullyQualifiedErrorId -eq 'PipelineStopped'
+    while ($null -ne $exception -and -not $stopped) {
+        if ($exception -is [System.Management.Automation.PipelineStoppedException] -or $exception -is [System.OperationCanceledException]) {
+            $stopped = $true
+        }
+        $exception = $exception.InnerException
+    }
+    return $stopped
+}
+
 $OriginalTemp = $env:TEMP
 $OriginalTmp = $env:TMP
 try {
@@ -213,22 +226,15 @@ Write-Log "Using protected temp directory: $ProtectedTemp"
 Save-ChocolateyProcessVariables
 
 try {
-    # A statement-terminating error inside try would otherwise skip the rest of
-    # this block. continue keeps the previous per-statement behaviour. Stopping
-    # the pipeline still leaves the block so finally can restore TEMP and
-    # remove the directory.
+    # The trap covers the bootstrap statement. Each package has its own catch,
+    # because continue here resumes after the whole foreach, not the next package.
+    # A pipeline stop still leaves the block so finally can restore TEMP.
     trap {
-        $exception = $_.Exception
-        $stopped = $_.FullyQualifiedErrorId -eq 'PipelineStopped'
-        while ($null -ne $exception -and -not $stopped) {
-            if ($exception -is [System.Management.Automation.PipelineStoppedException] -or $exception -is [System.OperationCanceledException]) {
-                $stopped = $true
-            }
-            $exception = $exception.InnerException
-        }
-        if ($stopped) {
+        if (Test-PipelineStop $_) {
             throw
         }
+        Write-Warning "Continuing after an error: $($_.Exception.Message)"
+        Write-Log "CONTINUE after error: $($_.Exception.Message)"
         continue
     }
 
@@ -351,28 +357,38 @@ Write-Host "Installing $($packages.Count) package(s)..." -ForegroundColor Cyan
 Write-Log "Installing $($packages.Count) package(s): $($packages -join ', ')"
 
 foreach ($pkg in $packages) {
-    Write-Host "==> Installing $pkg" -ForegroundColor Yellow
-    Write-Log "BEGIN install: $pkg"
+    try {
+        Write-Host "==> Installing $pkg" -ForegroundColor Yellow
+        Write-Log "BEGIN install: $pkg"
 
-    # Chocolatey's setup can reload session variables from the registry, which
-    # would put TEMP back on the user's profile and could bring back a user
-    # ChocolateyInstall or download URL.
-    Use-ProtectedTemp
-    Use-MachineChocolateyVariables
-    $output = & choco install -y $pkg 2>&1
-    $exitCode = $LASTEXITCODE
+        # Chocolatey's setup can reload session variables from the registry, which
+        # would put TEMP back on the user's profile and could bring back a user
+        # ChocolateyInstall or download URL.
+        Use-ProtectedTemp
+        Use-MachineChocolateyVariables
+        $output = & choco install -y $pkg 2>&1
+        $exitCode = $LASTEXITCODE
 
-    if ($UseLogging) {
-        Add-Content -Path $LogPath -Value $output
+        if ($UseLogging) {
+            Add-Content -Path $LogPath -Value $output
+        }
+
+        if ($exitCode -eq 0) {
+            Write-Host "✅ $pkg installed successfully" -ForegroundColor Green
+            Write-Log "SUCCESS install: $pkg (exit code $exitCode)"
+        }
+        else {
+            Write-Warning "❌ $pkg failed (exit code $exitCode)"
+            Write-Log "FAIL install: $pkg (exit code $exitCode)"
+            $failedPackages.Add($pkg) | Out-Null
+        }
     }
-
-    if ($exitCode -eq 0) {
-        Write-Host "✅ $pkg installed successfully" -ForegroundColor Green
-        Write-Log "SUCCESS install: $pkg (exit code $exitCode)"
-    }
-    else {
-        Write-Warning "❌ $pkg failed (exit code $exitCode)"
-        Write-Log "FAIL install: $pkg (exit code $exitCode)"
+    catch {
+        if (Test-PipelineStop $_) {
+            throw
+        }
+        Write-Warning "❌ $pkg failed: $($_.Exception.Message)"
+        Write-Log "FAIL install: $pkg ($($_.Exception.Message))"
         $failedPackages.Add($pkg) | Out-Null
     }
 }

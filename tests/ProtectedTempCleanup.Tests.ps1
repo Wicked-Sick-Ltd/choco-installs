@@ -1,7 +1,7 @@
 # install.ps1 must point TEMP at its protected directory only while it runs,
 # and must not keep a user ChocolateyInstall or download URL for that window.
 param(
-    [ValidateSet('all', 'success', 'stop', 'bootstrap')]
+    [ValidateSet('all', 'success', 'stop', 'bootstrap', 'nochoco')]
     [string]$Mode = 'all'
 )
 
@@ -13,7 +13,8 @@ $InstallScript = Join-Path $RepoRoot 'install.ps1'
 function Invoke-InstallUnderTest {
     param(
         [string]$StopAt,
-        [switch]$FailBootstrap
+        [switch]$FailBootstrap,
+        [switch]$NoChoco
     )
 
     $observedPath = Join-Path ([System.IO.Path]::GetTempPath()) ("choco-temp-observed-{0}.txt" -f [guid]::NewGuid().ToString('n'))
@@ -77,6 +78,7 @@ function Invoke-InstallUnderTest {
         Microsoft.PowerShell.Utility\New-Object @forward
     }
 
+    if (-not $NoChoco) {
     function choco {
         $package = $null
         for ($i = 0; $i -lt $args.Count; $i++) {
@@ -93,10 +95,12 @@ function Invoke-InstallUnderTest {
         }
         $global:LASTEXITCODE = 0
     }
+    }
 
     $failed = $false
+    $captured = [System.IO.StringWriter]::new()
     try {
-        . $InstallScript
+        . $InstallScript *>&1 | ForEach-Object { $captured.WriteLine($_.ToString()) }
     }
     catch {
         $failed = $true
@@ -105,6 +109,7 @@ function Invoke-InstallUnderTest {
 
     [pscustomobject]@{
         Failed         = $failed
+        Output         = $captured.ToString()
         OriginalTemp   = $originalTemp
         OriginalTmp    = $originalTmp
         Temp           = $env:TEMP
@@ -182,6 +187,25 @@ function Invoke-StopCase {
     Write-Host 'PASS stop'
 }
 
+function Invoke-NoChocoCase {
+    $result = Invoke-InstallUnderTest -NoChoco
+    if ($result.Failed) { throw 'a missing choco command aborted the script' }
+    $output = $result.Output
+    if ($output -notmatch 'Installing googlechrome' -or $output -notmatch 'Installing cascadia-code-nerd-font') {
+        throw "missing choco did not attempt every package`n$output"
+    }
+    if ($output -notmatch 'Some package installs failed') {
+        throw "missing choco was not reported as a package failure`n$output"
+    }
+    if ($output -match 'All packages installed successfully') {
+        throw "missing choco was reported as a full success`n$output"
+    }
+    if ($result.Temp -ne $result.OriginalTemp -or $result.Tmp -ne $result.OriginalTmp) {
+        throw 'TEMP/TMP were not restored after the missing-choco run'
+    }
+    Write-Host 'PASS nochoco'
+}
+
 function Invoke-BootstrapCase {
     $result = Invoke-InstallUnderTest -FailBootstrap
     if ($result.Failed) { throw 'a statement-terminating bootstrap error aborted the package loop' }
@@ -198,8 +222,9 @@ switch ($Mode) {
     'success' { Invoke-SuccessCase }
     'stop' { Invoke-StopCase }
     'bootstrap' { Invoke-BootstrapCase }
+    'nochoco' { Invoke-NoChocoCase }
     'all' {
-        foreach ($case in @('success', 'stop', 'bootstrap')) {
+        foreach ($case in @('success', 'stop', 'bootstrap', 'nochoco')) {
             & pwsh -NoProfile -File $PSCommandPath -Mode $case
             if ($LASTEXITCODE -ne 0) {
                 throw "case $case failed with exit $LASTEXITCODE"
