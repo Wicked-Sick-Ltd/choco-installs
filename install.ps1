@@ -491,8 +491,15 @@ function Initialize-InstallRecoveryDirectory {
             Add-Type -AssemblyName System.IO.FileSystem.AccessControl
         }
         $aclExtensions = 'System.IO.FileSystemAclExtensions' -as [type]
+        $create = $null
         if ($null -ne $aclExtensions) {
-            $aclExtensions::Create((New-Object System.IO.DirectoryInfo($directory)), $security)
+            # Windows PowerShell 5.1 can resolve the type without the DirectoryInfo overload.
+            $create = $aclExtensions.GetMethod('Create', [type[]]@(
+                    [System.IO.DirectoryInfo],
+                    [System.Security.AccessControl.DirectorySecurity]))
+        }
+        if ($null -ne $create) {
+            $null = $create.Invoke($null, @((New-Object System.IO.DirectoryInfo($directory)), $security))
         }
         else {
             $null = [System.IO.Directory]::CreateDirectory($directory, $security)
@@ -510,6 +517,8 @@ function Protect-RecoveryFileAcl {
     )
 
     $security = New-Object System.Security.AccessControl.FileSecurity
+    $adminsSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $security.SetOwner($adminsSid)
     $security.SetAccessRuleProtection($true, $false)
     foreach ($sid in @(
             [System.Security.Principal.WellKnownSidType]::LocalSystemSid,
@@ -528,20 +537,39 @@ function Protect-RecoveryFileAcl {
     }
 }
 
+function Test-ScriptRestrictedDacl {
+    param([string]$Sddl)
+    $normalized = ([string]$Sddl) -replace '\s', ''
+    return $normalized -eq 'D:P(A;;KA;;;SY)(A;;KA;;;BA)' -or $normalized -eq 'D:P(A;;KA;;;BA)(A;;KA;;;SY)'
+}
+
 function Capture-CommandProcessorDacl {
-    if (-not $OnWindows -or -not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
+    if (-not $OnWindows) {
+        return
+    }
+    # A value already loaded from the recovery file is the user's DACL. The
+    # restricted DACL this script applies is not an original and must not be saved again.
+    if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -and $Script:OriginalCommandProcessorDacl -ne 'inherit' -and -not (Test-ScriptRestrictedDacl $Script:OriginalCommandProcessorDacl)) {
         return
     }
     $relative = 'Software\Microsoft\Command Processor'
     if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
+        $Script:OriginalCommandProcessorDacl = 'inherit'
         return
     }
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($relative)
     if ($null -eq $key) {
+        $Script:OriginalCommandProcessorDacl = 'inherit'
         return
     }
     try {
-        $Script:OriginalCommandProcessorDacl = $key.GetAccessControl().GetSecurityDescriptorSddlForm('Access')
+        $current = $key.GetAccessControl().GetSecurityDescriptorSddlForm('Access')
+        if ([string]::IsNullOrWhiteSpace($current) -or (Test-ScriptRestrictedDacl $current)) {
+            $Script:OriginalCommandProcessorDacl = 'inherit'
+        }
+        else {
+            $Script:OriginalCommandProcessorDacl = $current
+        }
     }
     catch {
         Write-Log "WARN could not read the Command Processor DACL; the key will inherit permissions after the install."
@@ -566,12 +594,13 @@ function Restore-CommandProcessorDacl {
     }
     try {
         $security = $key.GetAccessControl()
-        if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
+        if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -and $Script:OriginalCommandProcessorDacl -ne 'inherit' -and -not (Test-ScriptRestrictedDacl $Script:OriginalCommandProcessorDacl)) {
             $security.SetSecurityDescriptorSddlForm(
                 $Script:OriginalCommandProcessorDacl,
                 [System.Security.AccessControl.AccessControlSections]::Access)
         }
         else {
+            $Script:OriginalCommandProcessorDacl = 'inherit'
             $security.SetAccessRuleProtection($false, $false)
         }
         $key.SetAccessControl($security)
@@ -599,7 +628,7 @@ function Write-InstallRecoveryFile {
     $payload = [pscustomobject]@{
         autorun                = $autorun
         userComSpec            = $(if ($Script:HadUserComSpec) { $Script:SavedUserComSpec } else { $null })
-        commandProcessorDacl   = $Script:OriginalCommandProcessorDacl
+        commandProcessorDacl   = $(if ([string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) { 'inherit' } else { $Script:OriginalCommandProcessorDacl })
     }
     Initialize-InstallRecoveryDirectory
     $path = Get-InstallRecoveryPath
@@ -950,8 +979,18 @@ foreach ($pkg in $packages) {
         Write-Host "==> Installing $pkg" -ForegroundColor Yellow
         Write-Log "BEGIN install: $pkg"
 
-        $output = & choco install -y $pkg 2>&1
-        $exitCode = $LASTEXITCODE
+        # Chocolatey's bootstrap often leaves ErrorAction Stop. Under Stop,
+        # 2>&1 turns choco's own stderr into a terminating error on Windows
+        # PowerShell 5.1 even when the install succeeded.
+        $previousErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = & choco install -y $pkg 2>&1
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorAction
+        }
 
         if ($UseLogging) {
             Add-Content -Path $LogPath -Value $output
