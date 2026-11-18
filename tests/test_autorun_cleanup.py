@@ -69,6 +69,8 @@ class AutoRunCleanupTests(unittest.TestCase):
             env.pop("CHOCO_TEST_BOOTSTRAP_FAIL", None)
             env.pop("CHOCO_TEST_NO_CHOCO", None)
             env.pop("CHOCO_TEST_FAIL_RESTORE_PATH", None)
+            env.pop("CHOCO_TEST_DACL_MODE", None)
+            env.pop("CHOCO_TEST_DACL_SDDL", None)
             if extra_env:
                 env.update(extra_env)
             proc = subprocess.run(
@@ -219,6 +221,87 @@ class AutoRunCleanupTests(unittest.TestCase):
         self.assertEqual(kept_paths[HKCU], r"echo %SystemRoot%\stay")
         self.assertEqual(kept_paths[HKLM], "echo stay-hklm")
         self.assertIsNone(restored[HKCU])
+
+    def test_deliberate_admin_only_dacl_is_restored_verbatim(self):
+        # Same shape the script used to treat as its own temporary DACL:
+        # protected, and every ACE is SYSTEM or Administrators.
+        locked = "D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)"
+        proc, restored, _log = self.run_install(
+            {
+                "CHOCO_TEST_DACL_MODE": "present",
+                "CHOCO_TEST_DACL_SDDL": locked,
+            }
+        )
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn(f"COMMAND_PROCESSOR_DACL={locked}", proc.stdout)
+        self.assertNotIn("COMMAND_PROCESSOR_DACL=inherit", proc.stdout)
+        self.assert_restored(restored)
+
+    def test_script_marker_without_a_saved_dacl_turns_inheritance_on(self):
+        temporary = "D:P(A;;KA;;;SY)(A;;KA;;;BA)"
+        proc, restored, _log = self.run_install(
+            {
+                "CHOCO_TEST_DACL_MODE": "marker",
+                "CHOCO_TEST_DACL_SDDL": temporary,
+            }
+        )
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("COMMAND_PROCESSOR_DACL=inherit", proc.stdout)
+        self.assertNotIn(temporary, proc.stdout)
+        self.assert_restored(restored)
+
+    def test_imported_dacl_is_kept_when_the_live_key_has_the_script_marker(self):
+        locked = "D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)"
+        temporary = "D:P(A;;KA;;;SY)(A;;KA;;;BA)"
+        empty = {HKLM: None, HKLM_WOW: None, HKCU: None}
+        recovery = {
+            "autorun": [
+                {"path": HKLM, "kind": "String", "value": "echo stay-hklm"},
+                {"path": HKCU, "kind": "ExpandString", "value": r"echo %SystemRoot%\stay"},
+            ],
+            "userComSpec": None,
+            "commandProcessorDacl": locked,
+        }
+        proc, restored, log = self.run_install(
+            {
+                "CHOCO_TEST_DACL_MODE": "marker",
+                "CHOCO_TEST_DACL_SDDL": temporary,
+            },
+            registry=empty,
+            recovery=recovery,
+        )
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn(f"COMMAND_PROCESSOR_DACL={locked}", proc.stdout)
+        self.assertNotIn("COMMAND_PROCESSOR_DACL=inherit", proc.stdout)
+        self.assertNotIn(temporary, proc.stdout)
+        self.assert_absent_during_installs(log)
+        self.assert_restored(restored)
+        self.assertFalse(self.recovery_path().exists())
+
+    def test_imported_inherit_is_not_replaced_by_the_live_temporary_dacl(self):
+        temporary = "D:P(A;;KA;;;SY)(A;;KA;;;BA)"
+        empty = {HKLM: None, HKLM_WOW: None, HKCU: None}
+        recovery = {
+            "autorun": [
+                {"path": HKLM, "kind": "String", "value": "echo stay-hklm"},
+                {"path": HKCU, "kind": "ExpandString", "value": r"echo %SystemRoot%\stay"},
+            ],
+            "userComSpec": None,
+            "commandProcessorDacl": "inherit",
+        }
+        proc, restored, log = self.run_install(
+            {
+                "CHOCO_TEST_DACL_MODE": "marker",
+                "CHOCO_TEST_DACL_SDDL": temporary,
+            },
+            registry=empty,
+            recovery=recovery,
+        )
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("COMMAND_PROCESSOR_DACL=inherit", proc.stdout)
+        self.assertNotIn(temporary, proc.stdout)
+        self.assert_absent_during_installs(log)
+        self.assert_restored(restored)
 
 
 if __name__ == "__main__":

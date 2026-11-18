@@ -232,6 +232,11 @@ $Script:SavedUserComSpec = $null
 $Script:ReplacedCommandProcessorLink = $false
 $Script:InstallRecoveryFailed = $false
 $Script:OriginalCommandProcessorDacl = $null
+# Written onto the temporary key this script creates. A later run treats that
+# key as script-made only when this value is present, not because the DACL
+# happens to grant SYSTEM and Administrators.
+$Script:CommandProcessorDaclMarkerName = 'choco-installs.temporary-dacl'
+$Script:CommandProcessorDaclMarkerValue = 'choco-installs'
 
 function Save-CommandProcessorAutoRunValue {
     param(
@@ -386,6 +391,7 @@ function Protect-UserCommandProcessorKey {
         # token does not have enabled. The label is applied by the call below.
         [RegistryIntegrityLabel]::CreateWithLabel($relative, 'D:P(A;;KA;;;SY)(A;;KA;;;BA)')
         Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
+        Set-CommandProcessorDaclMarker -Relative $relative
         $Script:ReplacedCommandProcessorLink = $true
         Write-Warning "Replaced the registry link at HKCU\$relative so an existing handle cannot set AutoRun."
         Write-Log "Replaced registry link: HKCU\$relative"
@@ -402,6 +408,14 @@ function Protect-UserCommandProcessorKey {
             foreach ($name in $existing.GetValueNames()) {
                 if ($name -eq 'AutoRun') {
                     continue
+                }
+                # A leftover marker is this script's, not a user setting. A different
+                # value under the same name belongs to the user and is copied across.
+                if ($name -eq $Script:CommandProcessorDaclMarkerName) {
+                    $markerValue = $existing.GetValue($name, $null)
+                    if ([string]$markerValue -eq $Script:CommandProcessorDaclMarkerValue) {
+                        continue
+                    }
                 }
                 $preserved.Add([pscustomobject]@{
                         Name  = $name
@@ -436,6 +450,7 @@ function Protect-UserCommandProcessorKey {
         $created.Close()
     }
     Set-UserKeyIntegrityLabel -SubKey $relative -Label 'S:(ML;;NW;;;HI)'
+    Set-CommandProcessorDaclMarker -Relative $relative
 }
 
 function Get-InstallRecoveryPath {
@@ -541,66 +556,126 @@ function Protect-RecoveryFileAcl {
     }
 }
 
-function Test-ScriptRestrictedDacl {
-    param([string]$Sddl)
-    $normalized = ([string]$Sddl) -replace '\s', ''
-    if ($normalized -notmatch '^D:P') {
-        return $false
-    }
-    $aces = [regex]::Matches($normalized, '\([^)]*\)')
-    if ($aces.Count -eq 0) {
-        return $false
-    }
-    foreach ($ace in $aces) {
-        if ($ace.Value -notmatch ';;;(SY|BA)\)$') {
-            return $false
-        }
-    }
-    return $true
-}
+function Set-CommandProcessorDaclMarker {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Relative
+    )
 
-function Capture-CommandProcessorDacl {
-    if (-not $OnWindows) {
-        return
-    }
-    # A value already loaded from the recovery file is the user's DACL. The
-    # restricted DACL this script applies is not an original and must not be saved again.
-    if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -and $Script:OriginalCommandProcessorDacl -ne 'inherit' -and -not (Test-ScriptRestrictedDacl $Script:OriginalCommandProcessorDacl)) {
-        return
-    }
-    $relative = 'Software\Microsoft\Command Processor'
-    if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
-        $Script:OriginalCommandProcessorDacl = 'inherit'
-        return
-    }
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($relative)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Relative, $true)
     if ($null -eq $key) {
-        $Script:OriginalCommandProcessorDacl = 'inherit'
-        return
+        throw "HKCU\$Relative could not be opened to mark its temporary permissions."
     }
     try {
-        $current = $key.GetAccessControl().GetSecurityDescriptorSddlForm('Access')
-        if ([string]::IsNullOrWhiteSpace($current) -or (Test-ScriptRestrictedDacl $current)) {
-            $Script:OriginalCommandProcessorDacl = 'inherit'
+        $existing = $key.GetValue($Script:CommandProcessorDaclMarkerName, $null)
+        if ($null -ne $existing -and [string]$existing -ne $Script:CommandProcessorDaclMarkerValue) {
+            Write-Log "WARN left the existing Command Processor value named $($Script:CommandProcessorDaclMarkerName) in place."
+            return
         }
-        else {
-            $Script:OriginalCommandProcessorDacl = $current
-        }
-    }
-    catch {
-        Write-Log "WARN could not read the Command Processor DACL; the key will inherit permissions after the install."
+        $key.SetValue(
+            $Script:CommandProcessorDaclMarkerName,
+            $Script:CommandProcessorDaclMarkerValue,
+            [Microsoft.Win32.RegistryValueKind]::String)
     }
     finally {
         $key.Close()
     }
 }
 
-function Restore-CommandProcessorDacl {
+function Remove-CommandProcessorDaclMarker {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Key
+    )
+
+    $existing = $Key.GetValue($Script:CommandProcessorDaclMarkerName, $null)
+    if ([string]$existing -eq $Script:CommandProcessorDaclMarkerValue) {
+        $Key.DeleteValue($Script:CommandProcessorDaclMarkerName, $false)
+    }
+}
+
+# Reads the live key. Returns $null when this host has nothing to inspect.
+# CHOCO_TEST_DACL_MODE is only consulted off Windows, so a test value cannot
+# change a real elevated run.
+function Get-CommandProcessorDaclState {
     if (-not $OnWindows) {
+        if ([string]::IsNullOrEmpty($env:CHOCO_TEST_DACL_MODE)) {
+            return $null
+        }
+        $mode = [string]$env:CHOCO_TEST_DACL_MODE
+        return @{
+            Missing = ($mode -eq 'missing')
+            Link    = ($mode -eq 'link')
+            Marker  = ($mode -eq 'marker')
+            Sddl    = [string]$env:CHOCO_TEST_DACL_SDDL
+        }
+    }
+
+    $relative = 'Software\Microsoft\Command Processor'
+    if ([RegistryIntegrityLabel]::IsSymbolicLink($relative)) {
+        return @{ Missing = $false; Link = $true; Marker = $false; Sddl = $null }
+    }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($relative)
+    if ($null -eq $key) {
+        return @{ Missing = $true; Link = $false; Marker = $false; Sddl = $null }
+    }
+    try {
+        $markerValue = $key.GetValue($Script:CommandProcessorDaclMarkerName, $null)
+        $current = $key.GetAccessControl().GetSecurityDescriptorSddlForm('Access')
+        return @{
+            Missing = $false
+            Link    = $false
+            Marker  = ([string]$markerValue -eq $Script:CommandProcessorDaclMarkerValue)
+            Sddl    = [string]$current
+        }
+    }
+    finally {
+        $key.Close()
+    }
+}
+
+function Capture-CommandProcessorDacl {
+    # An imported recovery file already decided. Keep that decision verbatim,
+    # including a DACL an admin set to SYSTEM and Administrators only, and
+    # including an explicit inherit. The shape of the live DACL is not evidence
+    # that this script created it.
+    if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
         return
     }
+    $state = $null
+    try {
+        $state = Get-CommandProcessorDaclState
+    }
+    catch {
+        Write-Log "WARN could not read the Command Processor DACL; the key will inherit permissions after the install."
+        return
+    }
+    if ($null -eq $state) {
+        return
+    }
+    # The marker is written only by this script, onto the temporary key. A
+    # missing key or a registry link has no user DACL to put back.
+    if ($state.Link -or $state.Missing -or $state.Marker -or [string]::IsNullOrWhiteSpace([string]$state.Sddl)) {
+        $Script:OriginalCommandProcessorDacl = 'inherit'
+        return
+    }
+    $Script:OriginalCommandProcessorDacl = [string]$state.Sddl
+}
+
+function Restore-CommandProcessorDacl {
+    if (-not $OnWindows) {
+        if ([string]::IsNullOrEmpty($env:CHOCO_TEST_DACL_MODE) -and [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
+            return
+        }
+        if ([string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -or $Script:OriginalCommandProcessorDacl -eq 'inherit') {
+            $Script:OriginalCommandProcessorDacl = 'inherit'
+        }
+        Write-Host "COMMAND_PROCESSOR_DACL=$($Script:OriginalCommandProcessorDacl)"
+        return
+    }
+
     $relative = 'Software\Microsoft\Command Processor'
-    $rights = [System.Security.AccessControl.RegistryRights]'ChangePermissions, ReadPermissions'
+    $rights = [System.Security.AccessControl.RegistryRights]'QueryValues, SetValue, ReadPermissions, ChangePermissions'
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
         $relative,
         [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
@@ -609,8 +684,18 @@ function Restore-CommandProcessorDacl {
         return
     }
     try {
+        try {
+            Remove-CommandProcessorDaclMarker -Key $key
+        }
+        catch {
+            # Leave the recovery file so the next run still has the saved DACL.
+            # A leftover marker would otherwise be taken as this script's key.
+            $Script:InstallRecoveryFailed = $true
+            Write-Warning "Unable to remove the temporary Command Processor marker. Error: $($_.Exception.Message)"
+            Write-Log "FAIL remove Command Processor marker: $($_.Exception.Message)"
+        }
         $security = $key.GetAccessControl()
-        if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -and $Script:OriginalCommandProcessorDacl -ne 'inherit' -and -not (Test-ScriptRestrictedDacl $Script:OriginalCommandProcessorDacl)) {
+        if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -and $Script:OriginalCommandProcessorDacl -ne 'inherit') {
             $security.SetSecurityDescriptorSddlForm(
                 $Script:OriginalCommandProcessorDacl,
                 [System.Security.AccessControl.AccessControlSections]::Access)
@@ -751,8 +836,8 @@ function Restore-InstallGuards {
         Unlock-UserAutoRunKeyChain
     }
     Restore-CommandProcessorAutoRunValues
+    Restore-CommandProcessorDacl
     if ($OnWindows) {
-        Restore-CommandProcessorDacl
         Resume-UserComSpec
     }
     Remove-InstallRecoveryFile
@@ -808,12 +893,14 @@ try {
     # A killed process does not run finally. A previous run may have left the
     # saved values in this file after deleting them from the registry.
     Import-InstallRecoveryFile
+    # Before the key is replaced. Off Windows this reads nothing unless a test
+    # probe is set, and then it records the same decision the Windows path uses.
+    Capture-CommandProcessorDacl
 
     if ($OnWindows) {
         # system() starts %ComSpec%, which a per-user environment variable can override.
         $env:ComSpec = Join-Path -Path ([System.Environment]::GetFolderPath('System')) -ChildPath 'cmd.exe'
 
-        Capture-CommandProcessorDacl
         foreach ($subKey in @('Software', 'Software\Microsoft')) {
             [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey).Close()
             Set-UserKeyIntegrityLabel -SubKey $subKey -Label 'S:(ML;;NW;;;HI)'
