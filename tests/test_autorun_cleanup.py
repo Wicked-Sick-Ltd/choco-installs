@@ -71,6 +71,8 @@ class AutoRunCleanupTests(unittest.TestCase):
             env.pop("CHOCO_TEST_FAIL_RESTORE_PATH", None)
             env.pop("CHOCO_TEST_DACL_MODE", None)
             env.pop("CHOCO_TEST_DACL_SDDL", None)
+            env.pop("CHOCO_TEST_DACL_OPEN_DENIED", None)
+            env.pop("CHOCO_TEST_SAVED_COMSPEC", None)
             if extra_env:
                 env.update(extra_env)
             proc = subprocess.run(
@@ -301,6 +303,40 @@ class AutoRunCleanupTests(unittest.TestCase):
         self.assertIn("COMMAND_PROCESSOR_DACL=inherit", proc.stdout)
         self.assertNotIn(temporary, proc.stdout)
         self.assert_absent_during_installs(log)
+        self.assert_restored(restored)
+
+    def test_denied_marker_open_still_restores_comspec_and_autorun(self):
+        locked = "D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)"
+        proc, restored, _log = self.run_install(
+            {
+                "CHOCO_TEST_DACL_MODE": "present",
+                "CHOCO_TEST_DACL_SDDL": locked,
+                "CHOCO_TEST_DACL_OPEN_DENIED": "setvalue",
+                "CHOCO_TEST_SAVED_COMSPEC": "kept-comspec",
+            }
+        )
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("Unable to remove the temporary Command Processor marker", output)
+        self.assertIn(f"COMMAND_PROCESSOR_DACL={locked}", proc.stdout)
+        self.assertIn("RESUMED_USER_COMSPEC=kept-comspec", proc.stdout)
+        self.assertNotIn("Unable to restore cmd.exe AutoRun or remove the integrity labels", output)
+        self.assert_restored(restored)
+
+    def test_denied_permission_open_still_resumes_comspec(self):
+        proc, restored, _log = self.run_install(
+            {
+                "CHOCO_TEST_DACL_MODE": "present",
+                "CHOCO_TEST_DACL_SDDL": "D:P(A;;KA;;;SY)(A;;KA;;;BA)",
+                "CHOCO_TEST_DACL_OPEN_DENIED": "permissions",
+                "CHOCO_TEST_SAVED_COMSPEC": "kept-comspec",
+            }
+        )
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("Unable to restore permissions on HKCU\\Software\\Microsoft\\Command Processor", output)
+        self.assertIn("RESUMED_USER_COMSPEC=kept-comspec", proc.stdout)
+        self.assertNotIn("Unable to restore cmd.exe AutoRun or remove the integrity labels", output)
         self.assert_restored(restored)
 
 

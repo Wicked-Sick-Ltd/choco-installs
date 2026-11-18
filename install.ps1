@@ -237,6 +237,13 @@ $Script:OriginalCommandProcessorDacl = $null
 # happens to grant SYSTEM and Administrators.
 $Script:CommandProcessorDaclMarkerName = 'choco-installs.temporary-dacl'
 $Script:CommandProcessorDaclMarkerValue = 'choco-installs'
+# Off Windows, a test can pretend a user ComSpec was saved so the resume step
+# is observable. A real run sets these only from Suspend-UserComSpec.
+if (-not $OnWindows -and -not [string]::IsNullOrEmpty($env:CHOCO_TEST_SAVED_COMSPEC)) {
+    $Script:UserComSpecSuspended = $true
+    $Script:HadUserComSpec = $true
+    $Script:SavedUserComSpec = [string]$env:CHOCO_TEST_SAVED_COMSPEC
+}
 
 function Save-CommandProcessorAutoRunValue {
     param(
@@ -354,6 +361,13 @@ function Assert-UserComSpecStillClear {
 
 function Resume-UserComSpec {
     if (-not $Script:UserComSpecSuspended) {
+        return
+    }
+    if (-not $OnWindows) {
+        Write-Host "RESUMED_USER_COMSPEC=$($Script:SavedUserComSpec)"
+        $Script:UserComSpecSuspended = $false
+        $Script:HadUserComSpec = $false
+        $Script:SavedUserComSpec = $null
         return
     }
     try {
@@ -662,37 +676,74 @@ function Capture-CommandProcessorDacl {
     $Script:OriginalCommandProcessorDacl = [string]$state.Sddl
 }
 
-function Restore-CommandProcessorDacl {
+function Open-CommandProcessorKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Relative,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Rights
+    )
+
+    # The denial switch is off-Windows only. An elevated run never consults it.
     if (-not $OnWindows) {
-        if ([string]::IsNullOrEmpty($env:CHOCO_TEST_DACL_MODE) -and [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
-            return
+        $denied = [string]$env:CHOCO_TEST_DACL_OPEN_DENIED
+        if ($denied -eq 'setvalue' -and $Rights -like '*SetValue*') {
+            throw "Access to the Command Processor key was denied for $Rights."
         }
-        if ([string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -or $Script:OriginalCommandProcessorDacl -eq 'inherit') {
-            $Script:OriginalCommandProcessorDacl = 'inherit'
+        if ($denied -eq 'permissions' -and $Rights -like '*ChangePermissions*') {
+            throw "Access to the Command Processor key was denied for $Rights."
         }
-        Write-Host "COMMAND_PROCESSOR_DACL=$($Script:OriginalCommandProcessorDacl)"
         return
     }
 
-    $relative = 'Software\Microsoft\Command Processor'
-    $rights = [System.Security.AccessControl.RegistryRights]'QueryValues, SetValue, ReadPermissions, ChangePermissions'
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
-        $relative,
+    return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+        $Relative,
         [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-        $rights)
-    if ($null -eq $key) {
+        ([System.Security.AccessControl.RegistryRights]$Rights))
+}
+
+function Restore-CommandProcessorDacl {
+    $relative = 'Software\Microsoft\Command Processor'
+    $testing = -not $OnWindows -and -not [string]::IsNullOrEmpty($env:CHOCO_TEST_DACL_MODE)
+    if (-not $OnWindows -and -not $testing -and [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl)) {
         return
     }
+
+    # SetValue is a separate open. A key that grants administrators read only
+    # denies it, and that denial must not skip the ComSpec restore.
+    $markerKey = $null
     try {
-        try {
-            Remove-CommandProcessorDaclMarker -Key $key
+        $markerKey = Open-CommandProcessorKey -Relative $relative -Rights 'QueryValues, SetValue'
+        if ($null -ne $markerKey) {
+            Remove-CommandProcessorDaclMarker -Key $markerKey
         }
-        catch {
-            # Leave the recovery file so the next run still has the saved DACL.
-            # A leftover marker would otherwise be taken as this script's key.
-            $Script:InstallRecoveryFailed = $true
-            Write-Warning "Unable to remove the temporary Command Processor marker. Error: $($_.Exception.Message)"
-            Write-Log "FAIL remove Command Processor marker: $($_.Exception.Message)"
+    }
+    catch {
+        $Script:InstallRecoveryFailed = $true
+        Write-Warning "Unable to remove the temporary Command Processor marker. Error: $($_.Exception.Message)"
+        Write-Log "FAIL remove Command Processor marker: $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $markerKey) {
+            $markerKey.Close()
+        }
+    }
+
+    # ReadPermissions and ChangePermissions are the rights the key owner keeps
+    # even when administrators cannot write the key.
+    $key = $null
+    try {
+        $key = Open-CommandProcessorKey -Relative $relative -Rights 'ReadPermissions, ChangePermissions'
+        if (-not $OnWindows) {
+            if ([string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -or $Script:OriginalCommandProcessorDacl -eq 'inherit') {
+                $Script:OriginalCommandProcessorDacl = 'inherit'
+            }
+            Write-Host "COMMAND_PROCESSOR_DACL=$($Script:OriginalCommandProcessorDacl)"
+            return
+        }
+        if ($null -eq $key) {
+            return
         }
         $security = $key.GetAccessControl()
         if (-not [string]::IsNullOrWhiteSpace($Script:OriginalCommandProcessorDacl) -and $Script:OriginalCommandProcessorDacl -ne 'inherit') {
@@ -713,7 +764,9 @@ function Restore-CommandProcessorDacl {
         Write-Log "FAIL restore Command Processor permissions: $($_.Exception.Message)"
     }
     finally {
-        $key.Close()
+        if ($null -ne $key) {
+            $key.Close()
+        }
     }
 }
 
@@ -837,9 +890,7 @@ function Restore-InstallGuards {
     }
     Restore-CommandProcessorAutoRunValues
     Restore-CommandProcessorDacl
-    if ($OnWindows) {
-        Resume-UserComSpec
-    }
+    Resume-UserComSpec
     Remove-InstallRecoveryFile
 }
 
