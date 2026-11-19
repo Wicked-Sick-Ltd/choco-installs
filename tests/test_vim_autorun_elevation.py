@@ -18,7 +18,6 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -133,7 +132,7 @@ class VimAutoRunElevationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             trace_path = Path(raw) / "trace.json"
             payload = ["python3", "-c", "pass"]
-            with mock.patch.object(chain.subprocess, "run") as run:
+            with unittest.mock.patch.object(chain.subprocess, "run") as run:
                 chain.run_vim_install_exe(
                     {"HKLM": payload, "HKCU": "cmd /c echo host"},
                     trace_path,
