@@ -105,12 +105,20 @@ def run_vim_install_exe(registry: dict, trace_path: Path) -> None:
         trace["reached_system"] = True
         trace["argv"] = argv
         if not command_line_has_disable_autorun(argv):
-            # cmd reads HKLM and then HKCU when /d is absent.
+            # cmd reads HKLM and then HKCU when /d is absent. The stored
+            # payload is an argv list. shell=True would start the host
+            # cmd.exe without /D and run that host's own AutoRun as well.
             for hive in ("HKLM", "HKCU"):
                 value = registry.get(hive)
-                if value:
-                    trace["autorun_executed"].append(hive)
-                    subprocess.run(value, shell=True, check=False)
+                if not value:
+                    continue
+                trace["autorun_executed"].append(hive)
+                if isinstance(value, list):
+                    subprocess.run(
+                        [str(part) for part in value],
+                        shell=False,
+                        check=False,
+                    )
 
     trace_path.write_text(json.dumps(trace))
 

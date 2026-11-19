@@ -16,7 +16,11 @@ param(
     [string]$TraceFile,
 
     [Parameter(Mandatory = $true)]
-    [string]$InvocationLog
+    [string]$InvocationLog,
+
+    # Define the stubs without running install.ps1. Tests use this to call
+    # the registry cmdlets directly.
+    [switch]$SkipInstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,7 +76,7 @@ function New-Object {
 function Update-AutoRunStore {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path,
+        [string[]]$Path,
 
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -86,24 +90,29 @@ function Update-AutoRunStore {
     if ($Name -ne 'AutoRun') {
         return
     }
-    if ($Path -notmatch '(?i)^HK(CU|LM):\\Software\\Microsoft\\Command Processor\\?$') {
-        return
-    }
-    $hive = if ($Path -match '(?i)^HKCU:') { 'HKCU' } else { 'HKLM' }
-    & python3 -c @'
+    # Real Remove-ItemProperty and Set-ItemProperty take a path array. One
+    # call can name both Command Processor keys; each element is applied on
+    # its own so a second path is not dropped.
+    foreach ($entry in $Path) {
+        if ($entry -notmatch '(?i)^HK(CU|LM):\\Software\\Microsoft\\Command Processor\\?$') {
+            continue
+        }
+        $hive = if ($entry -match '(?i)^HKCU:') { 'HKCU' } else { 'HKLM' }
+        & python3 -c @'
 import json, sys
 path, hive, mode, value = sys.argv[1:]
 state = json.load(open(path))
 state[hive] = None if mode == "clear" else value
 json.dump(state, open(path, "w"))
 '@ $RegistryFile $hive $(if ($Clear) { 'clear' } else { 'set' }) $(if ($null -eq $Value) { '' } else { $Value })
+    }
 }
 
 function Remove-ItemProperty {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true, Position = 0)]
-        [string]$Path,
+        [string[]]$Path,
 
         [Parameter(Mandatory = $true)]
         [string]$Name
@@ -116,7 +125,7 @@ function Set-ItemProperty {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true, Position = 0)]
-        [string]$Path,
+        [string[]]$Path,
 
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -151,4 +160,6 @@ function choco {
     $global:LASTEXITCODE = 0
 }
 
-. $InstallScript
+if (-not $SkipInstall) {
+    . $InstallScript
+}
