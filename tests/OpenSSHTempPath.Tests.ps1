@@ -1,6 +1,7 @@
 # Fails while install.ps1 installs openssh by id into a temp directory the
-# logged-on user can write. Passes once that install no longer publishes
-# replaced ssh, scp, and sftp binaries.
+# logged-on user can write. A temp outside the user profile is still writable
+# unless this test has marked that directory protected. Passes once that
+# install no longer publishes replaced ssh, scp, and sftp binaries.
 #
 # Run from the repository root:
 #   pwsh -NoProfile -File tests/OpenSSHTempPath.Tests.ps1
@@ -53,35 +54,93 @@ function ConvertTo-PortablePath {
     return (($Path -replace '\\', '/') -replace '/+', '/')
 }
 
-function Test-UnderUserProfile {
+$global:OpenSshProtectedDirectories = New-Object System.Collections.Generic.List[string]
+
+function Add-ProtectedDirectory {
     param([string]$Path)
-    $profile = ConvertTo-PortablePath $global:UserProfile
+    $portable = ConvertTo-PortablePath $Path
+    if ([string]::IsNullOrWhiteSpace($portable)) {
+        return
+    }
+    $global:OpenSshProtectedDirectories.Add($portable.TrimEnd('/')) | Out-Null
+}
+
+function Test-ProtectedPath {
+    param([string]$Path)
     $candidate = ConvertTo-PortablePath $Path
-    if ([string]::IsNullOrWhiteSpace($profile) -or [string]::IsNullOrWhiteSpace($candidate)) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
         return $false
     }
-    $profile = $profile.TrimEnd('/')
-    return ($candidate -eq $profile) -or $candidate.StartsWith($profile + '/', [StringComparison]::Ordinal)
+    $candidate = $candidate.TrimEnd('/')
+    foreach ($protected in $global:OpenSshProtectedDirectories) {
+        if ($candidate -eq $protected -or $candidate.StartsWith($protected + '/', [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-AttackerSearchRoots {
+    # Writable temps are not "anything outside the profile is safe". The
+    # profile, the process TEMP/TMP, and the runtime temp path are all
+    # searched unless a directory was explicitly marked protected.
+    $candidates = @(
+        $global:UserProfile,
+        $env:TEMP,
+        $env:TMP,
+        $env:temp,
+        $env:tmp
+    )
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in $candidates) {
+        $portable = ConvertTo-PortablePath $candidate
+        if ([string]::IsNullOrWhiteSpace($portable)) {
+            continue
+        }
+        $portable = $portable.TrimEnd('/')
+        if (-not (Test-Path -LiteralPath $portable)) {
+            continue
+        }
+        if (Test-ProtectedPath $portable) {
+            continue
+        }
+        $covered = $false
+        foreach ($existing in @($roots)) {
+            if ($existing -eq $portable -or $portable.StartsWith($existing + '/', [StringComparison]::OrdinalIgnoreCase)) {
+                $covered = $true
+                break
+            }
+        }
+        if ($covered) {
+            continue
+        }
+        $kept = New-Object System.Collections.Generic.List[string]
+        foreach ($existing in @($roots)) {
+            if (-not $existing.StartsWith($portable + '/', [StringComparison]::OrdinalIgnoreCase)) {
+                $kept.Add($existing) | Out-Null
+            }
+        }
+        $roots = $kept
+        $roots.Add($portable) | Out-Null
+    }
+    return $roots
 }
 
 function Update-LoggedOnUserReplacement {
-    # The logged-on user's filtered token can write the user profile, which is
-    # where an elevated same-user process leaves TEMP. It cannot write a
-    # directory outside that profile.
-    if ([string]::IsNullOrWhiteSpace($global:UserProfile) -or -not (Test-Path -LiteralPath $global:UserProfile)) {
-        return
-    }
-    $executables = Get-ChildItem -LiteralPath $global:UserProfile -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue
-    foreach ($executable in $executables) {
-        if (-not (Test-UnderUserProfile $executable.FullName)) {
-            continue
-        }
-        try {
-            [IO.File]::WriteAllBytes($executable.FullName, $AttackerMarker)
-            $global:AttackerReplacements++
-        }
-        catch {
-            # A directory the user cannot write is the protected case.
+    foreach ($root in @(Get-AttackerSearchRoots)) {
+        $executables = Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue
+        foreach ($executable in $executables) {
+            if (Test-ProtectedPath $executable.FullName) {
+                continue
+            }
+            try {
+                [IO.File]::WriteAllBytes($executable.FullName, $AttackerMarker)
+                $global:AttackerReplacements++
+            }
+            catch {
+                # The write itself failed. A directory is protected only when
+                # the test added it with Add-ProtectedDirectory.
+            }
         }
     }
 }
@@ -392,11 +451,11 @@ function Test-OpenSSHInstallDoesNotPublishReplacedTools {
 
     $result = Invoke-PackageInstall -PackageVersion $packageVersion -ProcessTemp $processTemp
     if (-not $result.KnownPackage) {
-        if (Test-UnderUserProfile $processTemp) {
-            Add-Failure $Name "choco install openssh selects package $packageVersion with TEMP '$processTemp' inside the logged-on user profile. This test has no installer for that version that avoids the temp copy."
+        if (Test-ProtectedPath $processTemp) {
+            Write-Host "PASS $Name (openssh $packageVersion temp is an explicitly protected directory)"
         }
         else {
-            Write-Host "PASS $Name (openssh $packageVersion temp is outside the logged-on user profile)"
+            Add-Failure $Name "choco install openssh selects package $packageVersion with TEMP '$processTemp', which is not an explicitly protected directory. The logged-on user can replace tools extracted there."
         }
         return
     }
@@ -446,26 +505,109 @@ function Test-OpenSSHInstallDoesNotPublishReplacedTools {
     Write-Host "PASS $Name"
 }
 
-$global:WorkRoot = Join-Path ([IO.Path]::GetTempPath()) ("openssh-temp-path-" + [guid]::NewGuid().ToString('n'))
-New-Item -ItemType Directory -Path $global:WorkRoot | Out-Null
-$global:UserProfile = Join-Path $global:WorkRoot 'Users\Administrator'
-$userTemp = Join-Path $global:UserProfile 'AppData\Local\Temp'
-New-Item -ItemType Directory -Path (ConvertTo-PortablePath $userTemp) -Force | Out-Null
-$programFiles = Join-Path $global:WorkRoot 'Program Files'
-New-Item -ItemType Directory -Path (ConvertTo-PortablePath $programFiles) -Force | Out-Null
-
-$env:USERPROFILE = $global:UserProfile
-foreach ($name in @('TEMP', 'temp', 'TMP', 'tmp')) {
-    Set-Item -Path "Env:$name" -Value $userTemp
+function Initialize-OpenSSHFixture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Profile', 'Outside', 'Protected')]
+        [string]$TempKind
+    )
+    $global:OpenSshProtectedDirectories = New-Object System.Collections.Generic.List[string]
+    $global:WorkRoot = Join-Path ([IO.Path]::GetTempPath()) ("openssh-temp-path-" + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Path $global:WorkRoot | Out-Null
+    $global:UserProfile = Join-Path $global:WorkRoot 'Users\Administrator'
+    $env:USERPROFILE = $global:UserProfile
+    $programFiles = Join-Path $global:WorkRoot 'Program Files'
+    $env:ProgramFiles = $programFiles
+    $env:ProgramData = Join-Path $global:WorkRoot 'ProgramData'
+    $env:windir = Join-Path $global:WorkRoot 'Windows'
+    $processTemp = switch ($TempKind) {
+        'Profile' { Join-Path $global:UserProfile 'AppData\Local\Temp' }
+        'Outside' { Join-Path $global:WorkRoot 'outside-temp' }
+        'Protected' { Join-Path $global:WorkRoot 'protected-temp' }
+    }
+    foreach ($directory in @($global:UserProfile, $processTemp, $programFiles, $env:ProgramData, $env:windir)) {
+        New-Item -ItemType Directory -Path (ConvertTo-PortablePath $directory) -Force | Out-Null
+    }
+    # Machine directories are protected because the test says so, not because
+    # they sit outside the profile. TEMP is protected only when requested.
+    foreach ($directory in @($programFiles, $env:ProgramData, $env:windir)) {
+        Add-ProtectedDirectory $directory
+    }
+    if ($TempKind -eq 'Protected') {
+        Add-ProtectedDirectory $processTemp
+    }
+    foreach ($name in @('TEMP', 'temp', 'TMP', 'tmp')) {
+        Set-Item -Path "Env:$name" -Value $processTemp
+    }
 }
-$env:ProgramFiles = $programFiles
-$env:ProgramData = Join-Path $global:WorkRoot 'ProgramData'
-$env:windir = Join-Path $global:WorkRoot 'Windows'
-New-Item -ItemType Directory -Path (ConvertTo-PortablePath $env:ProgramData) -Force | Out-Null
-New-Item -ItemType Directory -Path (ConvertTo-PortablePath $env:windir) -Force | Out-Null
 
+function Test-AttackerSearchIgnoresProfilePrefix {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("openssh-writable-" + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Path $root | Out-Null
+    try {
+        $global:OpenSshProtectedDirectories = New-Object System.Collections.Generic.List[string]
+        $global:UserProfile = Join-Path $root 'profile'
+        $outside = Join-Path $root 'outside-temp'
+        $protected = Join-Path $root 'protected-temp'
+        foreach ($directory in @($global:UserProfile, $outside, $protected)) {
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        }
+        $nested = Join-Path $outside 'nested-protected'
+        New-Item -ItemType Directory -Path $nested -Force | Out-Null
+        $original = [Text.Encoding]::ASCII.GetBytes('ORIGINAL-BYTES')
+        $profileExe = Join-Path $global:UserProfile 'ssh.exe'
+        $outsideExe = Join-Path $outside 'scp.exe'
+        $protectedExe = Join-Path $protected 'sftp.exe'
+        $nestedExe = Join-Path $nested 'ssh-agent.exe'
+        [IO.File]::WriteAllBytes($profileExe, $original)
+        [IO.File]::WriteAllBytes($outsideExe, $original)
+        [IO.File]::WriteAllBytes($protectedExe, $original)
+        [IO.File]::WriteAllBytes($nestedExe, $original)
+        Add-ProtectedDirectory $protected
+        Add-ProtectedDirectory $nested
+        foreach ($name in @('TEMP', 'temp', 'TMP', 'tmp')) {
+            Set-Item -Path "Env:$name" -Value $outside
+        }
+        $global:AttackerReplacements = 0
+        Update-LoggedOnUserReplacement
+        $profileOk = Test-SameBytes ([IO.File]::ReadAllBytes($profileExe)) $AttackerMarker
+        $outsideOk = Test-SameBytes ([IO.File]::ReadAllBytes($outsideExe)) $AttackerMarker
+        $protectedOk = Test-SameBytes ([IO.File]::ReadAllBytes($protectedExe)) $original
+        $nestedOk = Test-SameBytes ([IO.File]::ReadAllBytes($nestedExe)) $original
+        if (-not $profileOk) {
+            Add-Failure 'Writable temp model' 'an executable under the user profile was not replaced'
+        }
+        if (-not $outsideOk) {
+            Add-Failure 'Writable temp model' 'an executable in a temp outside the profile was not replaced'
+        }
+        if (-not $protectedOk) {
+            Add-Failure 'Writable temp model' 'an executable in an explicitly protected directory was replaced'
+        }
+        if (-not $nestedOk) {
+            Add-Failure 'Writable temp model' 'an executable in a protected directory under a writable temp was replaced'
+        }
+        if ($profileOk -and $outsideOk -and $protectedOk -and $nestedOk) {
+            Write-Host 'PASS Attacker replacement follows writable temps and skips protected directories'
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-AttackerSearchIgnoresProfilePrefix
+
+Initialize-OpenSSHFixture -TempKind Profile
 Write-Host "TEST Unpinned openssh install does not publish logged-on user replacements of ssh, scp, and sftp"
 Test-OpenSSHInstallDoesNotPublishReplacedTools -Name 'Unpinned openssh install does not publish logged-on user replacements of ssh, scp, and sftp'
+
+Initialize-OpenSSHFixture -TempKind Outside
+Write-Host "TEST Temp outside the user profile is still attacker-writable"
+Test-OpenSSHInstallDoesNotPublishReplacedTools -Name 'Temp outside the user profile is still attacker-writable'
+
+Initialize-OpenSSHFixture -TempKind Protected
+Write-Host "TEST Explicitly protected temp is not treated as attacker-writable"
+Test-OpenSSHInstallDoesNotPublishReplacedTools -Name 'Explicitly protected temp is not treated as attacker-writable'
 
 if ($script:Failures.Count -gt 0) {
     Write-Host ""
