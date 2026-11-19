@@ -20,9 +20,12 @@ logged-on user's standard token then runs again immediately before AppSearch:
 
 Get-Acl returns an object with SetOwner(account) and
 SetAccessRuleProtection(isProtected, preserveInheritance). Set-Acl writes that
-object back. HKCU:\\SOFTWARE\\Node.js starts owned by the logged-on user, with
-an explicit full-control entry for that user. Clearing the value leaves that
-entry in place, so the user can write the value again before the MSI reads it.
+object back. SetAccessRuleProtection only records that inheritance is off; it
+leaves explicit ACEs in place, so removing the logged-on user's FullControl
+entry takes a separate ACL change. HKCU:\\SOFTWARE\\Node.js starts owned by the
+logged-on user, with an explicit full-control entry for that user. Clearing
+the value leaves that entry in place, so the user can write the value again
+before the MSI reads it.
 """
 
 from __future__ import annotations
@@ -321,6 +324,7 @@ def apply_msi(state: dict, extra_args: str) -> None:
     lines 131-134 start that process as the current token when the session is
     already elevated, which is how install.ps1 is run.
     """
+    state["msi_applied"] = True
     attacker_plant_install_path(state)
     properties = {
         "ProgramFiles64Folder": PROGRAM_FILES,
@@ -425,6 +429,7 @@ def fresh_state(install_path: str, hklm_install_path: str | None = None) -> dict
         "last_install_dir": "",
         "last_msiexec": "",
         "resolved_node": None,
+        "msi_applied": False,
     }
     if hklm_install_path:
         state["registry"][r"HKLM\SOFTWARE\Node.js"] = {
@@ -559,8 +564,9 @@ class NodeRegAcl {
     NodeRegAcl() { $this.Aces = [System.Collections.Generic.List[object]]::new() }
     [void]SetOwner([object]$Account) { $this.Owner = "$Account" }
     [void]SetAccessRuleProtection([bool]$IsProtected, [bool]$PreserveInheritance) {
+        # Inheritance off removes inherited ACEs only. This model stores
+        # explicit entries, so they stay until a later ACL edit removes them.
         $this.DaclProtected = $IsProtected
-        if ($IsProtected -and -not $PreserveInheritance) { $this.Aces.Clear() }
     }
 }
 
@@ -656,9 +662,18 @@ function Get-Acl {
 }
 
 function Set-Acl {
-    [CmdletBinding()]
-    param([string]$Path, [string]$LiteralPath, [object]$AclObject)
-    $target = if ($LiteralPath) { $LiteralPath } else { $Path }
+    [CmdletBinding(DefaultParameterSetName = 'ByPath')]
+    param(
+        [Parameter(ParameterSetName = 'ByPath', Position = 0, Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(ParameterSetName = 'ByLiteralPath', Mandatory = $true)]
+        [string]$LiteralPath,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [object]$AclObject
+    )
+    $target = if ($PSCmdlet.ParameterSetName -eq 'ByLiteralPath') { $LiteralPath } else { $Path }
     if (-not (Test-RegistryPath $target)) { throw "Set-Acl is only simulated for HKCU/HKLM" }
     $aces = @()
     foreach ($ace in @($AclObject.Aces)) {
@@ -680,8 +695,8 @@ function Set-Acl {
 }
 
 function reg {
-    [CmdletBinding()]
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$RegArgs)
+    # No parameter block. An advanced function binds -v to -Verbose and drops it.
+    $RegArgs = @($args)
     $command = $RegArgs[0]
     $target = $RegArgs[1]
     if ($command -eq 'delete') {
@@ -710,8 +725,8 @@ function reg {
 }
 
 function choco {
-    [CmdletBinding()]
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ChocoArgs)
+    # No parameter block, so flags such as -y are arguments rather than parameters.
+    $ChocoArgs = @($args)
     $package = $null
     $extra = ''
     for ($i = 0; $i -lt $ChocoArgs.Count; $i++) {
@@ -734,17 +749,24 @@ function choco {
     & $python -c 'import sys; sys.exit(0)'
 }
 
-$tokens = $null
-$errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
-if ($errors -and $errors.Count -gt 0) { throw ($errors | Out-String) }
-$parts = New-Object System.Collections.Generic.List[string]
-foreach ($stmt in $ast.EndBlock.Statements) {
-    $text = $stmt.Extent.Text
-    if ($text -like '*community.chocolatey.org/install.ps1*') { continue }
-    $parts.Add($text) | Out-Null
+if ($env:NODE_INSTALL_TEST_SKIP_INSTALL -ne '1') {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) { throw ($errors | Out-String) }
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $ast.ParamBlock) {
+        $parts.Add($ast.ParamBlock.Extent.Text) | Out-Null
+    }
+    foreach ($stmt in $ast.EndBlock.Statements) {
+        $text = $stmt.Extent.Text
+        if ($text -like '*community.chocolatey.org/install.ps1*') { continue }
+        $parts.Add($text) | Out-Null
+    }
+    # param() is only legal at the start of a scriptblock, not under Invoke-Expression.
+    $replay = [scriptblock]::Create(($parts -join "`n"))
+    & $replay
 }
-Invoke-Expression ($parts -join "`n")
 """
 
 
@@ -776,6 +798,11 @@ def run_install_script(state: dict) -> dict:
                 "install.ps1 harness failed\n"
                 + completed.stdout[-4000:]
                 + "\n"
+                + completed.stderr[-4000:]
+            )
+        if "has not been set" in completed.stderr:
+            raise AssertionError(
+                "install.ps1 replay left a parameter uninitialized\n"
                 + completed.stderr[-4000:]
             )
         return json.loads(state_path.read_text())
@@ -842,19 +869,108 @@ class NodeMsiStandInTests(unittest.TestCase):
         self.assertEqual(state["files"][state["resolved_node"]]["content"], "OFFICIAL")
 
 
+def _ps_quote(path: Path) -> str:
+    return "'" + str(path).replace("'", "''") + "'"
+
+
+def run_harness_snippet(state: dict, body: str) -> dict:
+    """Dot-source the stubs and run body without replaying install.ps1."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        state_path = root / "state.json"
+        state_path.write_text(json.dumps(state))
+        harness = root / "harness.ps1"
+        harness.write_text(HARNESS)
+        driver = root / "drive.ps1"
+        driver.write_text(
+            "$env:NODE_INSTALL_TEST_SKIP_INSTALL = '1'\n. "
+            + _ps_quote(harness)
+            + "\n"
+            + body
+            + "\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "NODE_INSTALL_TEST_STATE": str(state_path),
+                "NODE_INSTALL_TEST_PYTHON": shutil.which("python3") or "python3",
+                "NODE_INSTALL_TEST_SCRIPT": str(INSTALL_SCRIPT),
+                "NODE_INSTALL_TEST_RUNNER": str(Path(__file__).resolve()),
+            }
+        )
+        completed = subprocess.run(
+            [_pwsh(), "-NoProfile", "-File", str(driver)],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(
+                "harness snippet failed\n" + completed.stdout[-2000:] + "\n" + completed.stderr[-2000:]
+            )
+        return json.loads(state_path.read_text())
+
+
+class HarnessContractTests(unittest.TestCase):
+    def test_positional_set_acl_keeps_the_explicit_attacker_ace(self) -> None:
+        result = run_harness_snippet(
+            fresh_state(r"C:\Users\alice\stage\node"),
+            "\n".join(
+                [
+                    "$acl = Get-Acl 'HKCU:\\SOFTWARE\\Node.js'",
+                    "$acl.SetOwner('NT AUTHORITY\\SYSTEM')",
+                    "$acl.SetAccessRuleProtection($true, $false)",
+                    "if ($acl.Aces.Count -lt 1) { throw 'SetAccessRuleProtection removed an explicit ACE' }",
+                    "Set-Acl 'HKCU:\\SOFTWARE\\Node.js' $acl",
+                ]
+            ),
+        )
+        key = result["registry"][r"HKCU\SOFTWARE\Node.js"]
+        self.assertEqual(key["owner"], "NT AUTHORITY\\SYSTEM")
+        self.assertTrue(key["protected"])
+        self.assertTrue(
+            any(ace.get("sid") == ATTACKER and "full" in ace.get("rights", []) for ace in key["aces"]),
+            key["aces"],
+        )
+
+    def test_reg_dash_v_removes_the_value_and_leaves_the_key(self) -> None:
+        result = run_harness_snippet(
+            fresh_state(r"C:\Users\alice\stage\node"),
+            "reg delete 'HKCU\\SOFTWARE\\Node.js' -v InstallPath /f",
+        )
+        key = result["registry"].get(r"HKCU\SOFTWARE\Node.js")
+        self.assertIsNotNone(key, result["registry"])
+        self.assertNotIn("InstallPath", key.get("values", {}))
+
+    def test_choco_install_y_reaches_the_msi(self) -> None:
+        result = run_harness_snippet(
+            fresh_state(r"C:\Users\alice\stage\node"),
+            "choco install -y nodejs-lts",
+        )
+        self.assertTrue(result["msi_applied"], result.get("attack_detail"))
+
+
 class InstallScriptTests(unittest.TestCase):
+    def assert_official_machine_node(self, result: dict) -> None:
+        self.assertTrue(result.get("msi_applied"), "nodejs-lts MSI did not run")
+        resolved = result.get("resolved_node")
+        self.assertTrue(resolved, "machine PATH did not resolve node.exe")
+        self.assertNotIn("alice", resolved.lower(), result.get("attack_detail"))
+        self.assertEqual(result["files"][resolved]["content"], "OFFICIAL")
+        self.assertFalse(result["attack_succeeded"], result.get("attack_detail"))
+
     def test_logged_on_user_install_path_does_not_become_machine_node(self) -> None:
         state = fresh_state(r"C:\Users\alice\stage\node")
         result = run_install_script(state)
-        self.assertFalse(result["attack_succeeded"], result["attack_detail"])
-        if result.get("resolved_node"):
-            self.assertNotIn("alice", result["resolved_node"].lower(), result["attack_detail"])
-            self.assertEqual(result["files"][result["resolved_node"]]["content"], "OFFICIAL")
+        self.assert_official_machine_node(result)
 
     def test_existing_machine_install_path_does_not_keep_the_current_user_path(self) -> None:
         state = fresh_state(r"C:\Users\alice\stage\node", hklm_install_path=DEFAULT_INSTALL_DIR)
         result = run_install_script(state)
-        self.assertFalse(result["attack_succeeded"], result["attack_detail"])
+        self.assert_official_machine_node(result)
 
 
 if __name__ == "__main__":
