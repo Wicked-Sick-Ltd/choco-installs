@@ -57,7 +57,7 @@ If script execution is blocked, PowerShell can show an error similar to:
 - Review package names before running bulk installs.
 - Pin versions for mission-critical tools when reproducibility matters.
 - Run in an elevated PowerShell when package installs require admin rights.
-- The script unpacks packages into a private directory under Program Files (mode 0700 off Windows) and points `TEMP` and `TMP` at it for the duration of the installs. It does not leave that work in the logged-on user's temp directory.
+- On Windows the script unpacks packages into a private directory under the known Program Files folder, not a `ProgramFiles` value from the user environment, and points `TEMP` and `TMP` at it for the duration of the installs. Off Windows that directory is mode 0700. It does not leave that work in the logged-on user's temp directory.
 
 ## Contributing
 

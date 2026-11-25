@@ -48,9 +48,10 @@ function Write-Log {
 # copy what they find there with this session's elevated rights. The logged-on
 # user's TEMP (or any directory they can write) lets that user swap the files in
 # between. openssh's package reads $env:temp, extracts OpenSSH-Win64.zip there,
-# and copies those bytes onto the machine PATH. That directory has to sit under
-# Program Files, which is the machine location the install treats as protected,
-# and it still has to be a directory only SYSTEM and Administrators can write.
+# and copies those bytes onto the machine PATH. On Windows that directory is
+# created under the known Program Files folder (then ProgramData), never under
+# a ProgramFiles value from the user's environment, and only SYSTEM and
+# Administrators can write it. Off Windows it is mode 0700.
 function Test-DirectoryUnderPath {
     param(
         [string]$Child,
@@ -68,39 +69,45 @@ function Test-DirectoryUnderPath {
 }
 
 function Get-ProtectedTempParent {
-    # Prefer the process ProgramFiles value when it names a real directory
-    # outside the user profile. An elevated session's Program Files is that
-    # folder, and a caller that points ProgramFiles at a protected fixture is
-    # honoured the same way. A value planted inside the profile is ignored.
-    # On Windows the known Program Files folder, then ProgramData, is the
-    # fallback. Off Windows there is no known Program Files folder; the caller
-    # uses mktemp instead of the Linux ProgramData path (/usr/share).
-    $candidates = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
-        $candidates.Add($env:ProgramFiles.TrimEnd('\', '/')) | Out-Null
-    }
+    # On Windows the parent comes only from the known-folder API. $env:ProgramFiles
+    # is a user environment value, and a folder outside the profile is still
+    # writable by the logged-on user. Program Files, then ProgramData.
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         foreach ($folder in @(
                 [Environment+SpecialFolder]::ProgramFiles,
                 [Environment+SpecialFolder]::CommonApplicationData
             )) {
             $known = [Environment]::GetFolderPath($folder)
-            if (-not [string]::IsNullOrWhiteSpace($known)) {
-                $candidates.Add($known.TrimEnd('\', '/')) | Out-Null
+            if ([string]::IsNullOrWhiteSpace($known)) {
+                continue
             }
+            $known = $known.TrimEnd('\', '/')
+            if (-not (Test-Path -LiteralPath $known -PathType Container)) {
+                continue
+            }
+            if (Test-DirectoryUnderPath -Child $known -Parent $env:USERPROFILE) {
+                continue
+            }
+            return $known
         }
+        return $null
     }
 
-    foreach ($candidate in $candidates) {
-        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
-            continue
-        }
-        if (Test-DirectoryUnderPath -Child $candidate -Parent $env:USERPROFILE) {
-            continue
-        }
-        return $candidate
+    # Off Windows there is no known Program Files folder (and the Linux
+    # ProgramData path is /usr/share, which is not a private temp). The OpenSSH
+    # spec points $env:ProgramFiles at the directory it has marked protected.
+    # A value inside the user profile is ignored; the caller then uses mktemp.
+    if ([string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        return $null
     }
-    return $null
+    $candidate = $env:ProgramFiles.TrimEnd('\', '/')
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        return $null
+    }
+    if (Test-DirectoryUnderPath -Child $candidate -Parent $env:USERPROFILE) {
+        return $null
+    }
+    return $candidate
 }
 
 function New-ProtectedTempDirectory {
