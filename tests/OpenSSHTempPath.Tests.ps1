@@ -157,10 +157,14 @@ function global:Set-ExecutionPolicy {
 function global:choco {
     $global:LASTEXITCODE = 0
     if (@($args) -contains 'openssh') {
+        # The package reads $env:temp. On a case-sensitive host that is not
+        # $env:TEMP, so the replay has to use the variable the package reads.
         $global:OpenSshInvocations += [pscustomobject]@{
             Arguments = @($args)
             Temp      = $env:TEMP
+            LowerTemp = $env:temp
             Tmp       = $env:TMP
+            LowerTmp  = $env:tmp
         }
     }
 }
@@ -443,10 +447,20 @@ function Test-OpenSSHInstallDoesNotPublishReplacedTools {
 
     $invocation = $global:OpenSshInvocations[-1]
     $packageVersion = Resolve-SelectedPackage -Arguments $invocation.Arguments
-    $processTemp = $invocation.Temp
+    $processTemp = $invocation.LowerTemp
     if ([string]::IsNullOrWhiteSpace($processTemp)) {
-        Add-Failure $Name 'choco install openssh ran with TEMP unset, so the package falls back to a world-writable temp.'
+        Add-Failure $Name 'choco install openssh ran with temp unset, so the package reads an attacker-writable temp.'
         return
+    }
+    foreach ($seen in @(
+            @{ Name = 'TEMP'; Value = $invocation.Temp },
+            @{ Name = 'TMP'; Value = $invocation.Tmp },
+            @{ Name = 'tmp'; Value = $invocation.LowerTmp }
+        )) {
+        if (-not [string]::IsNullOrWhiteSpace($seen.Value) -and $seen.Value -ne $processTemp) {
+            Add-Failure $Name "$($seen.Name) is '$($seen.Value)' while the package reads temp '$processTemp'."
+            return
+        }
     }
 
     $result = Invoke-PackageInstall -PackageVersion $packageVersion -ProcessTemp $processTemp

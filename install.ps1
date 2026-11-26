@@ -116,23 +116,16 @@ function New-ProtectedTempDirectory {
     $parent = Get-ProtectedTempParent
 
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        # mktemp creates the directory 0700 in one step. New-Item then chmod
+        # leaves a window where the directory is 0777 under umask 000.
         if ([string]::IsNullOrWhiteSpace($parent)) {
-            # mktemp creates the directory 0700 in one step.
-            $path = & mktemp -d (Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath "$name-XXXXXXXX")
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($path)) {
-                throw "mktemp failed to create a private temp directory."
-            }
-            return $path
+            $parent = [IO.Path]::GetTempPath()
         }
-
-        $path = Join-Path -Path $parent -ChildPath $name
-        New-Item -ItemType Directory -Path $path | Out-Null
-        & chmod 700 -- $path
-        if ($LASTEXITCODE -ne 0) {
-            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-            throw "chmod failed to make '$path' private."
+        $path = & mktemp -d (Join-Path -Path $parent -ChildPath "$name-XXXXXXXX")
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($path)) {
+            throw "mktemp failed to create a private temp directory."
         }
-        return $path
+        return $path.Trim()
     }
 
     if ([string]::IsNullOrWhiteSpace($parent)) {
