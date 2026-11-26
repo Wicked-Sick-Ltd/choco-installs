@@ -47,26 +47,89 @@ function Write-Log {
 # The Chocolatey bootstrap and package scripts unpack into TEMP and then run or
 # copy what they find there with this session's elevated rights. The logged-on
 # user's TEMP (or any directory they can write) lets that user swap the files in
-# between, so every install uses a directory only SYSTEM and Administrators can
-# write.
+# between. openssh's package reads $env:temp, extracts OpenSSH-Win64.zip there,
+# and copies those bytes onto the machine PATH. On Windows that directory is
+# created under the known Program Files folder (then ProgramData), never under
+# a ProgramFiles value from the user's environment, and only SYSTEM and
+# Administrators can write it. Off Windows it is mode 0700.
+function Test-DirectoryUnderPath {
+    param(
+        [string]$Child,
+        [string]$Parent
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Child) -or [string]::IsNullOrWhiteSpace($Parent)) {
+        return $false
+    }
+
+    $left = (($Child -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+    $right = (($Parent -replace '\\', '/') -replace '/+', '/').TrimEnd('/')
+    return ($left.Equals($right, [StringComparison]::OrdinalIgnoreCase) -or
+        $left.StartsWith($right + '/', [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Get-ProtectedTempParent {
+    # On Windows the parent comes only from the known-folder API. $env:ProgramFiles
+    # is a user environment value, and a folder outside the profile is still
+    # writable by the logged-on user. Program Files, then ProgramData.
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        foreach ($folder in @(
+                [Environment+SpecialFolder]::ProgramFiles,
+                [Environment+SpecialFolder]::CommonApplicationData
+            )) {
+            $known = [Environment]::GetFolderPath($folder)
+            if ([string]::IsNullOrWhiteSpace($known)) {
+                continue
+            }
+            $known = $known.TrimEnd('\', '/')
+            if (-not (Test-Path -LiteralPath $known -PathType Container)) {
+                continue
+            }
+            if (Test-DirectoryUnderPath -Child $known -Parent $env:USERPROFILE) {
+                continue
+            }
+            return $known
+        }
+        return $null
+    }
+
+    # Off Windows there is no known Program Files folder (and the Linux
+    # ProgramData path is /usr/share, which is not a private temp). The OpenSSH
+    # spec points $env:ProgramFiles at the directory it has marked protected.
+    # A value inside the user profile is ignored; the caller then uses mktemp.
+    if ([string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        return $null
+    }
+    $candidate = $env:ProgramFiles.TrimEnd('\', '/')
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        return $null
+    }
+    if (Test-DirectoryUnderPath -Child $candidate -Parent $env:USERPROFILE) {
+        return $null
+    }
+    return $candidate
+}
+
 function New-ProtectedTempDirectory {
     $ErrorActionPreference = 'Stop'
     $name = "choco-installs-{0}" -f [guid]::NewGuid().ToString('n')
+    $parent = Get-ProtectedTempParent
 
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-        # mktemp creates the directory 0700 in one step.
-        $path = & mktemp -d (Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath "$name-XXXXXXXX")
+        # mktemp creates the directory 0700 in one step. New-Item then chmod
+        # leaves a window where the directory is 0777 under umask 000.
+        if ([string]::IsNullOrWhiteSpace($parent)) {
+            $parent = [IO.Path]::GetTempPath()
+        }
+        $path = & mktemp -d (Join-Path -Path $parent -ChildPath "$name-XXXXXXXX")
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($path)) {
             throw "mktemp failed to create a private temp directory."
         }
-        return $path
+        return $path.Trim()
     }
 
-    # Resolved through the known-folder API: $env:ProgramData can be overridden
-    # from the user's own environment.
-    $parent = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
     if ([string]::IsNullOrWhiteSpace($parent)) {
-        throw "Unable to resolve the ProgramData folder."
+        throw "Unable to resolve Program Files or ProgramData for the install temp directory."
     }
     $path = Join-Path -Path $parent -ChildPath $name
 
@@ -88,9 +151,9 @@ function New-ProtectedTempDirectory {
     }
 
     # The owner and DACL are applied by the create call itself, so there is no
-    # window in which the directory carries ProgramData's inherited
-    # Users-can-create ACEs. Creating it with an Administrators owner also fails
-    # outside an elevated session.
+    # window in which the directory carries the parent's inherited ACEs.
+    # Creating it with an Administrators owner also fails outside an elevated
+    # session.
     # Windows PowerShell keeps these types in mscorlib.
     if ($PSVersionTable.PSEdition -eq 'Core') {
         Add-Type -AssemblyName System.IO.FileSystem.AccessControl
@@ -123,8 +186,11 @@ function New-ProtectedTempDirectory {
 }
 
 function Use-ProtectedTemp {
-    $env:TEMP = $ProtectedTemp
-    $env:TMP = $ProtectedTemp
+    # Windows treats these names as one variable. PowerShell on a case-sensitive
+    # host does not, and the openssh package reads $env:temp.
+    foreach ($name in @('TEMP', 'temp', 'TMP', 'tmp')) {
+        Set-Item -Path "Env:$name" -Value $ProtectedTemp
+    }
 }
 
 # The bootstrap and choco inherit this process environment, including values a
@@ -182,17 +248,18 @@ function Restore-ChocolateyProcessVariables {
 }
 
 function Restore-InstallEnvironment {
-    if ($null -ne $OriginalTemp) {
-        $env:TEMP = $OriginalTemp
-    }
-    elseif (Test-Path -Path Env:TEMP) {
-        Remove-Item -Path Env:TEMP
-    }
-    if ($null -ne $OriginalTmp) {
-        $env:TMP = $OriginalTmp
-    }
-    elseif (Test-Path -Path Env:TMP) {
-        Remove-Item -Path Env:TMP
+    foreach ($saved in @(
+            @{ Name = 'TEMP'; Had = $HadOriginalTemp; Value = $OriginalTemp },
+            @{ Name = 'temp'; Had = $HadOriginalTempLower; Value = $OriginalTempLower },
+            @{ Name = 'TMP'; Had = $HadOriginalTmp; Value = $OriginalTmp },
+            @{ Name = 'tmp'; Had = $HadOriginalTmpLower; Value = $OriginalTmpLower }
+        )) {
+        if ($saved.Had) {
+            Set-Item -Path "Env:$($saved.Name)" -Value $saved.Value
+        }
+        elseif (Test-Path -Path "Env:$($saved.Name)") {
+            Remove-Item -Path "Env:$($saved.Name)"
+        }
     }
     if (-not [string]::IsNullOrWhiteSpace($ProtectedTemp) -and (Test-Path -LiteralPath $ProtectedTemp)) {
         Remove-Item -LiteralPath $ProtectedTemp -Recurse -Force -ErrorAction SilentlyContinue
@@ -1155,8 +1222,14 @@ catch {
     throw "Refusing to install packages while cmd.exe AutoRun could run with administrator rights. $reason"
 }
 
+$HadOriginalTemp = Test-Path -Path Env:TEMP
 $OriginalTemp = $env:TEMP
+$HadOriginalTempLower = Test-Path -Path Env:temp
+$OriginalTempLower = $env:temp
+$HadOriginalTmp = Test-Path -Path Env:TMP
 $OriginalTmp = $env:TMP
+$HadOriginalTmpLower = Test-Path -Path Env:tmp
+$OriginalTmpLower = $env:tmp
 try {
     $ProtectedTemp = New-ProtectedTempDirectory
 }

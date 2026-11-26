@@ -1,0 +1,59 @@
+name: tests
+
+# The OpenSSH spec starts .\7z.exe after `chmod +x`. That file is a Python
+# shebang adapter, which Start-Process can run on Linux and cannot run as a
+# Windows image. The job is ubuntu-latest so `pwsh -NoProfile -File
+# tests/OpenSSHTempPath.Tests.ps1` is the command the spec names, with python3
+# and 7z installed. windows-latest fails that harness before it checks the
+# installed tools.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    name: PowerShell tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install PowerShell and 7-Zip
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/powershell.tar.gz \
+            https://github.com/PowerShell/PowerShell/releases/download/v7.5.4/powershell-7.5.4-linux-x64.tar.gz
+          sudo mkdir -p /opt/microsoft/powershell/7
+          sudo tar -xzf /tmp/powershell.tar.gz -C /opt/microsoft/powershell/7
+          sudo chmod +x /opt/microsoft/powershell/7/pwsh
+          sudo ln -sf /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          pwsh --version
+          command -v 7z
+          command -v python3
+
+      - name: Run tests/*.Tests.ps1
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(tests/*.Tests.ps1)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no PowerShell tests found" >&2
+            exit 1
+          fi
+          failed=0
+          for file in "${files[@]}"; do
+            echo "==> $file"
+            if ! pwsh -NoProfile -File "$file"; then
+              echo "FAIL $file" >&2
+              failed=1
+            fi
+          done
+          exit "$failed"
