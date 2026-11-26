@@ -1,0 +1,4 @@
+{
+  "name": "choco-installs",
+  "install": "bash .cursor/install.sh"
+}

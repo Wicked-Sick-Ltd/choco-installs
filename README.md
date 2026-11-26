@@ -59,6 +59,10 @@ If script execution is blocked, PowerShell can show an error similar to:
 - Run in an elevated PowerShell when package installs require admin rights.
 - On Windows the script unpacks packages into a private directory under the known Program Files folder, not a `ProgramFiles` value from the user environment, and points `TEMP` and `TMP` at it for the duration of the installs. Off Windows that directory is mode 0700. It does not leave that work in the logged-on user's temp directory.
 
+## Cloud agent environment
+
+Cursor Cloud Agents run on Linux. `.cursor/install.sh` installs PowerShell 7, PSScriptAnalyzer, and Pester so agents can parse-check and lint the scripts in this repo. Chocolatey (`choco`) cannot run on the Linux VM. `install.ps1` is a Windows bootstrap and is not executed there. No secret environment variables are required.
+
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
